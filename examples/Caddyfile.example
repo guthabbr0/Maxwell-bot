@@ -1,0 +1,28 @@
+maxwell.example.com {
+	root * /var/www/maxwell
+	header X-Frame-Options "DENY"
+	header X-Content-Type-Options "nosniff"
+	header Referrer-Policy "strict-origin-when-cross-origin"
+
+	# Backend routes. The backend also requires Basic auth.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+	handle /data/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	# Optional extra protection for admin UI.
+	@admin path /admin /admin/*
+	handle @admin {
+		basic_auth {
+			admin $2a$14$replace_with_caddy_hash
+		}
+		file_server
+	}
+
+	# Prefer serving generated bot sites from a separate origin.
+	header /bot/* -X-Frame-Options
+
+	file_server
+}

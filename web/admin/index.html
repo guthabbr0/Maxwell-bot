@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maxwell // Admin Interface</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#04060b;--bg2:#080c16;--bg3:#0c1122;--card:#0e1530;--card-h:#121a3a;--bdr:#1a2744;--bdr-h:#2a4a7a;--fg:#d4ddf0;--fg2:#8899b8;--fg3:#4a5a78;--cyan:#00e5ff;--cyan2:#00b8d4;--cyan-g:rgba(0,229,255,.15);--magenta:#ff00e5;--mag-g:rgba(255,0,229,.15);--ok:#00ff88;--ok-g:rgba(0,255,136,.12);--warn:#ffaa00;--err:#ff3355;--font:'JetBrains Mono','Space Grotesk',monospace;--sans:'Space Grotesk',system-ui,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:3px}::-webkit-scrollbar-thumb:hover{background:var(--bdr-h)}
+html,body{background:var(--bg);color:var(--fg);font-family:var(--font);line-height:1.5;min-height:100vh}
+a{color:var(--cyan);text-decoration:none;transition:all .2s}a:hover{color:#fff;text-shadow:0 0 8px var(--cyan)}
+
+.top{height:52px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:var(--bg2);position:sticky;top:0;z-index:100}
+.top-left{display:flex;align-items:center;gap:14px}
+.logo{font-size:16px;font-weight:800;letter-spacing:-0.02em;background:linear-gradient(135deg,var(--cyan),var(--magenta));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-family:var(--sans)}
+.badge{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:3px 8px;border-radius:4px;background:var(--ok-g);color:var(--ok);border:1px solid rgba(0,255,136,.2)}
+.badge.off{background:rgba(255,51,85,.12);color:var(--err);border-color:rgba(255,51,85,.2)}
+.top-nav{display:flex;gap:6px}
+.top-nav a{color:var(--fg3);font-size:11px;font-weight:600;padding:4px 10px;border-radius:4px;border:1px solid transparent;transition:all .15s;text-transform:uppercase;letter-spacing:.04em}
+.top-nav a:hover{color:var(--fg2);background:rgba(255,255,255,.03)}
+.top-nav a.accent{color:var(--magenta);border-color:rgba(255,0,229,.3)}
+
+.layout{display:grid;grid-template-columns:170px 1fr;min-height:calc(100vh - 52px)}
+nav{border-right:1px solid var(--bdr);background:var(--bg2);padding:8px}
+nav button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;color:var(--fg3);border:none;border-radius:6px;padding:8px 10px;font:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .12s;letter-spacing:.02em}
+nav button:hover{background:rgba(0,229,255,.04);color:var(--fg2)}
+nav button.active{color:var(--cyan);background:rgba(0,229,255,.08);border-left:2px solid var(--cyan)}
+nav button .icon{font-size:14px;width:18px;text-align:center}
+
+main{padding:16px;overflow:auto}
+
+.card{border:1px solid var(--bdr);background:var(--card);border-radius:10px;padding:14px;margin-bottom:12px}
+.card h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--cyan2);margin:0 0 10px;display:flex;align-items:center;gap:6px}
+.card h2::before{content:'';display:inline-block;width:3px;height:12px;background:var(--cyan);border-radius:2px}
+pre,code,.mono{font-family:var(--font)}
+pre{margin:0;padding:10px;background:var(--bg);border:1px solid var(--bdr);border-radius:6px;overflow:auto;font-size:11px;line-height:1.6;max-height:500px;white-space:pre-wrap;word-break:break-word}
+
+button,input,textarea,select{background:var(--bg);color:var(--fg);border:1px solid var(--bdr);padding:7px 10px;font:inherit;border-radius:6px;font-size:12px;transition:all .12s}
+button{cursor:pointer}
+button:hover{border-color:var(--cyan);background:var(--bg3)}
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--cyan);outline-offset:-1px}
+textarea{width:100%;min-height:120px;resize:vertical;line-height:1.4}
+
+.btn{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;padding:6px 14px;border-radius:6px;border:1px solid;cursor:pointer;transition:all .12s;letter-spacing:.02em}
+.btn-cyan{background:var(--cyan-g);border-color:rgba(0,229,255,.3);color:var(--cyan)}
+.btn-cyan:hover{background:rgba(0,229,255,.25);border-color:var(--cyan)}
+.btn-ok{background:var(--ok-g);border-color:rgba(0,255,136,.3);color:var(--ok)}
+.btn-ok:hover{background:rgba(0,255,136,.25)}
+.btn-err{background:rgba(255,51,85,.1);border-color:rgba(255,51,85,.3);color:var(--err)}
+.btn-err:hover{background:rgba(255,51,85,.2)}
+.btn-warn{background:rgba(255,170,0,.1);border-color:rgba(255,170,0,.3);color:var(--warn)}
+.btn-warn:hover{background:rgba(255,170,0,.2)}
+
+.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row input{flex:1;min-width:200px}
+
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+
+.msg{font-size:12px;padding:8px 12px;border-radius:6px;margin-bottom:8px;display:none;font-weight:500}
+.msg.ok{background:var(--ok-g);border:1px solid rgba(0,255,136,.3);color:var(--ok);display:block}
+.msg.err{background:rgba(255,51,85,.1);border:1px solid rgba(255,51,85,.3);color:var(--err);display:block}
+
+.muted{color:var(--fg3);font-size:11px}
+.pill{display:inline-flex;align-items:center;border:1px solid var(--bdr);border-radius:999px;padding:2px 8px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.pill.on{color:var(--ok);border-color:rgba(0,255,136,.25);background:var(--ok-g)}
+.pill.off{color:var(--fg3);border-color:rgba(255,255,255,.05)}
+
+.control-section{margin-top:12px;border-top:1px solid var(--bdr);padding-top:12px}
+.control-section:first-child{margin-top:0;border-top:0;padding-top:0}
+.control-section h3{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--magenta);margin:0 0 8px;font-weight:700}
+.control-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}
+.control-item{border:1px solid var(--bdr);border-radius:8px;padding:10px;background:var(--bg)}
+.control-item label{display:flex;justify-content:space-between;gap:8px;font-size:12px;align-items:center}
+.control-item input[type="number"]{width:85px}
+
+.switch{position:relative;display:inline-block;width:36px;height:20px}
+.switch input{opacity:0;width:0;height:0}
+.switch .slider{position:absolute;cursor:pointer;inset:0;background:var(--bdr);border-radius:10px;transition:.2s}
+.switch .slider::before{content:'';position:absolute;height:14px;width:14px;left:3px;bottom:3px;background:var(--fg3);border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:rgba(0,255,136,.25)}
+.switch input:checked+.slider::before{transform:translateX(16px);background:var(--ok);box-shadow:0 0 6px var(--ok)}
+
+.tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px;margin-top:8px}
+.tool-chip{display:flex;gap:6px;align-items:center;border:1px solid var(--bdr);border-radius:6px;padding:6px 8px;font-size:11px;color:var(--fg3);cursor:pointer;transition:all .12s}
+.tool-chip.enabled{color:var(--ok);border-color:rgba(0,255,136,.3)}
+.tool-chip:hover{border-color:var(--bdr-h)}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--bdr)}
+th{font-weight:600;color:var(--fg3);font-size:10px;text-transform:uppercase;letter-spacing:.06em}
+tr:hover{background:rgba(0,229,255,.02)}
+
+.log-viewer{background:var(--bg);border:1px solid var(--bdr);border-radius:6px;padding:10px;font-family:var(--font);font-size:11px;line-height:1.6;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:var(--fg2)}
+
+.mini-ta{min-height:80px;font-size:11px}
+
+.pm2-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.pm2-card{border:1px solid var(--bdr);background:var(--card);border-radius:10px;padding:14px}
+.pm2-card h3{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--cyan);margin:0 0 8px;font-weight:700}
+.pm2-row{display:flex;justify-content:space-between;padding:4px 0;font-size:12px;border-bottom:1px solid rgba(26,39,68,.5)}
+.pm2-row:last-child{border-bottom:0}
+
+.stat-card{background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:14px;text-align:center;position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat-card.c1::before{background:linear-gradient(90deg,var(--cyan),transparent)}
+.stat-card.c2::before{background:linear-gradient(90deg,var(--magenta),transparent)}
+.stat-card.c3::before{background:linear-gradient(90deg,var(--ok),transparent)}
+.stat-val{font-size:28px;font-weight:800;font-family:var(--sans)}
+.stat-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg3);margin-top:2px;font-weight:700}
+
+.chan-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid var(--bdr);font-size:12px;cursor:pointer;transition:all .1s}
+.chan-row:hover{background:rgba(0,229,255,.03)}
+.chan-row.active{background:rgba(0,229,255,.06);border-left:2px solid var(--cyan)}
+.chan-id{font-family:var(--font);font-size:11px;color:var(--cyan)}
+
+.chat-area{flex:1;border:1px solid var(--bdr);background:var(--bg);border-radius:6px;padding:10px;max-height:380px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+.chat-msg{padding:6px 8px;border-bottom:1px solid rgba(26,39,68,.4);font-size:12px}
+.chat-msg:last-child{border-bottom:0}
+.chat-author{font-weight:700;font-size:11px}
+.chat-author.bot{color:var(--cyan)}
+.chat-author.user{color:var(--magenta)}
+.chat-time{font-size:9px;color:var(--fg3)}
+.chat-input-row{display:flex;gap:8px;margin-top:8px}
+.chat-input-row input{flex:1}
+
+@media(max-width:900px){.layout{grid-template-columns:1fr}nav{display:none}.grid-2,.grid-3{grid-template-columns:1fr}.pm2-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body x-data="adminPanel()">
+
+<div class="top">
+<div class="top-left">
+  <span class="logo">MAXWELL ADMIN</span>
+  <span class="badge" :class="stats.online?'':'off'" x-text="stats.online?'Online':'Offline'">...</span>
+</div>
+<div class="top-nav">
+  <a href="/">Dashboard</a>
+  <a href="/admin/" class="accent">Admin</a>
+</div>
+</div>
+
+<div class="layout">
+<nav>
+  <template x-for="t in tabs" :key="t">
+    <button :class="tab===t?'active':''" @click="tab=t">
+      <span class="icon" x-text="tabIcons[t]||''"></span>
+      <span x-text="t"></span>
+    </button>
+  </template>
+</nav>
+
+<main>
+  <!-- ═══ Overview ═══ -->
+  <template x-if="tab==='Overview'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+
+      <div class="pm2-grid">
+        <div class="pm2-card">
+          <h3>maxwell-bot</h3>
+          <template x-if="pm2.bot">
+            <div>
+              <div class="pm2-row"><span>Status</span><span class="pill" :class="pm2.bot.status==='online'?'on':'off'" x-text="pm2.bot.status"></span></div>
+              <div class="pm2-row"><span>Uptime</span><span class="mono" x-text="pm2.bot.uptime?formatUptime(pm2.bot.uptime):'-'" style="color:var(--fg)"></span></div>
+              <div class="pm2-row"><span>Restarts</span><span class="mono" x-text="pm2.bot.restart_time??'0'" style="color:var(--warn)"></span></div>
+            </div>
+          </template>
+          <template x-if="!pm2.bot"><div class="muted">No PM2 data</div></template>
+          <div class="actions" style="margin-top:8px">
+            <button class="btn btn-cyan" @click="restartPm2('maxwell-bot')">Restart Bot</button>
+            <button class="btn btn-err" @click="restartPm2('all')">Restart All</button>
+          </div>
+        </div>
+        <div class="pm2-card">
+          <h3>maxwell-api</h3>
+          <template x-if="pm2.api">
+            <div>
+              <div class="pm2-row"><span>Status</span><span class="pill" :class="pm2.api.status==='online'?'on':'off'" x-text="pm2.api.status"></span></div>
+              <div class="pm2-row"><span>Uptime</span><span class="mono" x-text="pm2.api.uptime?formatUptime(pm2.api.uptime):'-'" style="color:var(--fg)"></span></div>
+            </div>
+          </template>
+          <template x-if="!pm2.api"><div class="muted">No PM2 data</div></template>
+          <div class="actions" style="margin-top:8px">
+            <button class="btn btn-cyan" @click="restartPm2('maxwell-api')">Restart API</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-3" style="margin-bottom:12px">
+        <div class="stat-card c1"><div class="stat-val" x-text="stats.guilds">0</div><div class="stat-lbl">Guilds</div></div>
+        <div class="stat-card c2"><div class="stat-val" x-text="stats.channels">0</div><div class="stat-lbl">Channels</div></div>
+        <div class="stat-card c3"><div class="stat-val" x-text="stats.memories">0</div><div class="stat-lbl">LT Memories</div></div>
+      </div>
+
+      <div class="grid-3" style="margin-bottom:12px">
+        <div class="stat-card c1"><div class="stat-val" x-text="stats.sites">0</div><div class="stat-lbl">Sites</div></div>
+        <div class="stat-card c2"><div class="stat-val" x-text="stats.blacklist">0</div><div class="stat-lbl">Blacklisted</div></div>
+        <div class="stat-card c3"><div class="stat-val" x-text="stats.prompts">0</div><div class="stat-lbl">Prompts</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Admin Login</h2>
+        <div class="row">
+          <input x-model="adminUser" autocomplete="username" placeholder="username" style="width:180px">
+          <input type="password" x-model="adminPass" autocomplete="current-password" placeholder="password" style="width:180px">
+          <button class="btn btn-cyan" @click="saveLogin()">Save</button>
+          <button class="btn btn-err" @click="clearLogin()">Clear</button>
+        </div>
+        <div class="muted" style="margin-top:6px">All API/data requests require auth. Passwords are kept in memory only.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Quick Actions ═══ -->
+  <template x-if="tab==='Actions'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>Send to Channel</h2>
+          <input x-model="actionChannelId" placeholder="Discord channel ID" style="width:100%;margin-bottom:6px">
+          <textarea x-model="actionMessage" placeholder="message text" rows="3"></textarea>
+          <div class="actions"><button class="btn btn-cyan" @click="runAction('send_message',{channel_id:actionChannelId,content:actionMessage})">Send</button></div>
+        </div>
+
+        <div class="card">
+          <h2>Send DM</h2>
+          <input x-model="actionDmUserId" placeholder="Discord user ID" style="width:100%;margin-bottom:6px">
+          <textarea x-model="actionDmMessage" placeholder="DM text" rows="3"></textarea>
+          <div class="actions"><button class="btn btn-cyan" @click="runAction('send_dm',{user_id:actionDmUserId,content:actionDmMessage})">Send DM</button></div>
+        </div>
+
+        <div class="card">
+          <h2>Set Presence</h2>
+          <div class="row" style="margin-bottom:6px">
+            <select x-model="actionStatus" style="width:120px"><option value="online">online</option><option value="idle">idle</option><option value="dnd">dnd</option><option value="invisible">invisible</option></select>
+            <select x-model="actionActivityType" style="width:120px"><option value="">none</option><option value="playing">playing</option><option value="watching">watching</option><option value="listening">listening</option><option value="competing">competing</option></select>
+          </div>
+          <input x-model="actionActivityText" placeholder="activity text" style="width:100%" x-show="actionActivityType">
+          <div class="actions"><button class="btn btn-cyan" @click="runAction('set_presence',{status:actionStatus,activity_type:actionActivityType,activity_text:actionActivityText})">Update</button></div>
+        </div>
+
+        <div class="card">
+          <h2>Custom Status</h2>
+          <input x-model="actionCustomStatus" placeholder="custom status text" style="width:100%">
+          <div class="actions"><button class="btn btn-cyan" @click="runAction('set_custom_status',{text:actionCustomStatus})">Set</button><button class="btn btn-err" @click="runAction('set_custom_status',{text:''})">Clear</button></div>
+        </div>
+
+        <div class="card">
+          <h2>Change Avatar</h2>
+          <input x-model="actionAvatarUrl" placeholder="direct image URL" style="width:100%">
+          <div class="actions"><button class="btn btn-cyan" @click="runAction('change_avatar',{url:actionAvatarUrl})">Change</button></div>
+        </div>
+
+        <div class="card">
+          <h2>Shell Command</h2>
+          <textarea x-model="actionShellCmd" placeholder="shell command" rows="2"></textarea>
+          <div class="actions"><button class="btn btn-warn" @click="runAction('shell',{command:actionShellCmd})">Run</button></div>
+          <pre x-text="actionShellResult" x-show="actionShellResult" style="margin-top:8px"></pre>
+        </div>
+
+        <div class="card">
+          <h2>Clear Memory</h2>
+          <input x-model="actionClearChannelId" placeholder="Discord channel ID" style="width:100%">
+          <div class="actions"><button class="btn btn-err" @click="runAction('clear_memory',{channel_id:actionClearChannelId})">Clear Memory</button></div>
+        </div>
+
+        <div class="card">
+          <h2>System</h2>
+          <div class="actions">
+            <button class="btn btn-cyan" @click="runAction('reload_controls',{})">Reload Controls</button>
+            <button class="btn btn-err" @click="runAction('kick_bot',{})">Kick Bot</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Command History</h2>
+        <div class="actions" style="margin-bottom:8px"><button class="btn btn-cyan" @click="loadCommands()">Refresh</button></div>
+        <table>
+          <thead><tr><th>ID</th><th>Type</th><th>Status</th><th>Result</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="cmd in commandHistory" :key="cmd.id">
+              <tr>
+                <td class="mono" style="color:var(--cyan)" x-text="cmd.id"></td>
+                <td class="mono" x-text="cmd.type"></td>
+                <td><span class="pill" :class="cmd.status==='done'?'on':'off'" x-text="cmd.status"></span></td>
+                <td style="max-width:200px;word-break:break-word;color:var(--fg2)" x-text="cmd.result?.substring(0,120)||''"></td>
+                <td><button class="btn btn-err" style="padding:3px 8px;font-size:10px" @click="deleteCommand(cmd.id)">Del</button></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Controls ═══ -->
+  <template x-if="tab==='Controls'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+      <div class="card">
+        <h2>Runtime Bot Controls</h2>
+        <div class="control-section">
+          <h3>Global</h3>
+          <div class="control-grid">
+            <div class="control-item"><label>Bot enabled <label class="switch"><input type="checkbox" x-model="control.bot_enabled"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Error replies <label class="switch"><input type="checkbox" x-model="control.error_replies"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Log messages <label class="switch"><input type="checkbox" x-model="control.log_messages"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Typing indicator <label class="switch"><input type="checkbox" x-model="control.typing_indicator"><span class="slider"></span></label></label></div>
+          </div>
+        </div>
+        <div class="control-section">
+          <h3>Replies</h3>
+          <div class="control-grid">
+            <div class="control-item"><label>Reply DMs <label class="switch"><input type="checkbox" x-model="control.reply_dms"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Reply groups <label class="switch"><input type="checkbox" x-model="control.reply_groups"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Reply mentions <label class="switch"><input type="checkbox" x-model="control.reply_mentions"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Reply bots <label class="switch"><input type="checkbox" x-model="control.reply_to_bots"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Cooldown <input type="number" min="0" step="0.1" x-model.number="control.per_user_cooldown_seconds" style="width:80px"></label></div>
+          </div>
+        </div>
+        <div class="control-section">
+          <h3>Auto Mode</h3>
+          <div class="control-grid">
+            <div class="control-item"><label>Auto enabled <label class="switch"><input type="checkbox" x-model="control.auto_mode_enabled"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Eval every <input type="number" min="1" max="100" x-model.number="control.auto_eval_every" style="width:80px"></label></div>
+            <div class="control-item"><label>Recent cap <input type="number" min="0" max="100" x-model.number="control.auto_max_recent_replies" style="width:80px"></label></div>
+            <div class="control-item"><label>Window min <input type="number" min="1" max="1440" x-model.number="control.auto_recent_window_minutes" style="width:80px"></label></div>
+            <div class="control-item"><label>Inactivity min <input type="number" min="0" max="10080" x-model.number="control.auto_inactivity_minutes" style="width:80px"></label></div>
+          </div>
+          <textarea class="mini-ta" x-model="control.auto_decider_prompt" placeholder="auto decider prompt" style="margin-top:8px"></textarea>
+        </div>
+        <div class="control-section">
+          <h3>Memory & Context</h3>
+          <div class="control-grid">
+            <div class="control-item"><label>Store memory <label class="switch"><input type="checkbox" x-model="control.store_memory"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Use LTM <label class="switch"><input type="checkbox" x-model="control.long_term_memory_enabled"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Emoji ctx <label class="switch"><input type="checkbox" x-model="control.emoji_context_enabled"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Music ctx <label class="switch"><input type="checkbox" x-model="control.music_context_enabled"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>History msgs <input type="number" min="0" max="100" x-model.number="control.memory_history_messages" style="width:80px"></label></div>
+            <div class="control-item"><label>Context budget <input type="number" min="1000" max="100000" step="1000" x-model.number="control.memory_context_budget" style="width:80px"></label></div>
+          </div>
+        </div>
+        <div class="control-section">
+          <h3>AI Runtime</h3>
+          <div class="control-grid">
+            <div class="control-item"><label>Tools enabled <label class="switch"><input type="checkbox" x-model="control.tools_enabled"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Process images <label class="switch"><input type="checkbox" x-model="control.process_images"><span class="slider"></span></label></label></div>
+            <div class="control-item"><label>Max img MB <input type="number" min="1" max="25" x-model.number="control.max_image_size_mb" style="width:80px"></label></div>
+            <div class="control-item"><label>AI timeout <input type="number" min="10" max="600" x-model.number="control.ai_timeout_seconds" style="width:80px"></label></div>
+            <div class="control-item"><label>Concurrency <input type="number" min="1" max="10" x-model.number="control.ai_concurrency" style="width:80px"></label></div>
+            <div class="control-item"><label>Tool iters <input type="number" min="0" max="25" x-model.number="control.max_tool_iterations" style="width:80px"></label></div>
+            <div class="control-item"><label>Response chars <input type="number" min="80" max="4000" x-model.number="control.max_response_chars" style="width:80px"></label></div>
+          </div>
+        </div>
+        <div class="control-section">
+          <h3>Access Lists</h3>
+          <div class="grid-3">
+            <div><div class="muted" style="margin-bottom:4px">Ignore users</div><textarea class="mini-ta" x-model="listText.ignore_users" placeholder="one user ID per line"></textarea></div>
+            <div><div class="muted" style="margin-bottom:4px">Allowed channels</div><textarea class="mini-ta" x-model="listText.allowed_channels" placeholder="empty = all"></textarea></div>
+            <div><div class="muted" style="margin-bottom:4px">Blocked channels</div><textarea class="mini-ta" x-model="listText.blocked_channels" placeholder="one channel ID per line"></textarea></div>
+          </div>
+          <div style="margin-top:8px"><div class="muted" style="margin-bottom:4px">Disabled commands</div><textarea class="mini-ta" x-model="listText.disabled_commands" placeholder="prompt, clearprompt, ..."></textarea></div>
+        </div>
+        <div class="control-section">
+          <h3>Personality</h3>
+          <div class="muted" style="margin-bottom:6px">Sets chat style. Does NOT modify hardcoded system prompt.</div>
+          <textarea class="mini-ta" x-model="control.base_personality" placeholder="base personality prompt"></textarea>
+        </div>
+        <div class="actions">
+          <button class="btn btn-cyan" @click="saveControl()">Save Controls</button>
+          <button class="btn btn-err" @click="resetControl()">Reset Defaults</button>
+        </div>
+        <div class="muted" style="margin-top:6px">Bot reloads these within ~5 seconds.</div>
+      </div>
+
+      <div class="card">
+        <h2>Tool Access</h2>
+        <div class="muted">Checked = enabled. Uncheck to disable a tool.</div>
+        <div class="tool-grid">
+          <template x-for="tool in tools" :key="tool">
+            <label class="tool-chip" :class="!isToolDisabled(tool)?'enabled':''">
+              <input type="checkbox" :checked="!isToolDisabled(tool)" @change="toggleTool(tool)">
+              <span class="mono" x-text="tool"></span>
+            </label>
+          </template>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Memory ═══ -->
+  <template x-if="tab==='Memory'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+      <div class="card">
+        <h2>Add Memory</h2>
+        <textarea x-model="newMemory" placeholder="memory content..." rows="3"></textarea>
+        <div class="actions"><button class="btn btn-cyan" @click="addMemory()">Add</button></div>
+      </div>
+      <div class="card">
+        <h2>Long-Term Memories</h2>
+        <input x-model="memFilter" placeholder="search..." style="width:100%;margin-bottom:8px">
+        <table>
+          <thead><tr><th>ID</th><th>Content</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="m in filteredMemories()" :key="m.id">
+              <tr>
+                <td class="mono" style="color:var(--cyan);width:40px" x-text="m.id"></td>
+                <td><textarea class="mini-ta" x-model="m.content" style="min-height:50px"></textarea></td>
+                <td style="width:100px"><div class="actions"><button class="btn btn-cyan" style="padding:4px 10px;font-size:10px" @click="saveMemory(m)">Save</button><button class="btn btn-err" style="padding:4px 10px;font-size:10px" @click="deleteMemory(m.id)">Del</button></div></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div x-show="memories.length===0" class="muted" style="padding:16px;text-align:center">No memories.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Sites ═══ -->
+  <template x-if="tab==='Sites'">
+    <div>
+      <div class="card">
+        <h2>Tracked Sites</h2>
+        <table>
+          <thead><tr><th>Slug</th><th>Title</th><th>User</th><th>Age</th><th>Left</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="[slug,s] in Object.entries(sites)" :key="slug">
+              <tr>
+                <td class="mono" style="color:var(--cyan)" x-text="slug"></td>
+                <td><input x-model="s.title" style="width:100%"></td>
+                <td x-text="s.user_name"></td>
+                <td class="mono" x-text="siteAge(s.created_at)" style="color:var(--fg2)"></td>
+                <td class="mono" x-text="siteRemaining(s.created_at)" style="color:var(--warn)"></td>
+                <td><div class="actions"><a :href="'/bot/'+slug+'/'" target="_blank" style="color:var(--cyan);font-size:11px">View</a><button class="btn btn-cyan" style="padding:3px 8px;font-size:10px" @click="saveSite(slug,s)">Save</button><button class="btn btn-ok" style="padding:3px 8px;font-size:10px" @click="extendSite(slug)">Extend</button><button class="btn btn-err" style="padding:3px 8px;font-size:10px" @click="deleteSite(slug)">Del</button></div></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div x-show="Object.keys(sites).length===0" class="muted" style="padding:16px;text-align:center">No sites.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Prompts ═══ -->
+  <template x-if="tab==='Prompts'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+      <div class="card">
+        <h2>Server Prompts</h2>
+        <div style="max-height:500px;overflow:auto">
+          <template x-for="[id,text] in Object.entries(prompts)" :key="id">
+            <div style="border-bottom:1px solid var(--bdr);padding:12px 0">
+              <div class="mono" style="color:var(--magenta);font-size:10px;margin-bottom:4px" x-text="id"></div>
+              <textarea x-model="prompts[id]" rows="3"></textarea>
+              <div class="actions"><button class="btn btn-cyan" style="padding:4px 10px;font-size:10px" @click="savePrompt(id)">Save</button><button class="btn btn-err" style="padding:4px 10px;font-size:10px" @click="deletePrompt(id)">Delete</button></div>
+            </div>
+          </template>
+        </div>
+        <div x-show="Object.keys(prompts).length===0" class="muted" style="padding:16px;text-align:center">No prompts.</div>
+        <div style="margin-top:12px;border-top:1px solid var(--bdr);padding-top:12px">
+          <input x-model="newPromptId" placeholder="server ID" style="width:200px;margin-right:8px">
+          <textarea x-model="newPromptText" placeholder="prompt text" rows="2"></textarea>
+          <div class="actions"><button class="btn btn-cyan" @click="addPrompt()">Add Prompt</button></div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Blacklist ═══ -->
+  <template x-if="tab==='Blacklist'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+      <div class="card">
+        <h2>Blacklist</h2>
+        <div class="actions" style="margin-bottom:8px">
+          <input x-model="newBlacklistId" placeholder="Discord user ID" style="width:220px">
+          <button class="btn btn-err" @click="addBlacklist()">Block</button>
+        </div>
+        <table>
+          <thead><tr><th>User ID</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="uid in blacklist" :key="uid">
+              <tr><td class="mono" style="color:var(--cyan)" x-text="uid"></td><td><button class="btn btn-ok" style="padding:3px 8px;font-size:10px" @click="removeBlacklist(uid)">Remove</button></td></tr>
+            </template>
+          </tbody>
+        </table>
+        <div x-show="blacklist.length===0" class="muted" style="padding:16px;text-align:center">No blocked users.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Auto Channels ═══ -->
+  <template x-if="tab==='Auto Chan'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+      <div class="card">
+        <h2>Auto Reply Channels</h2>
+        <div class="row" style="margin-bottom:8px">
+          <input x-model="newAutoChannelId" placeholder="Discord channel ID">
+          <button class="btn btn-cyan" @click="addAutoChannel()">Enable</button>
+        </div>
+        <table>
+          <thead><tr><th>Channel ID</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="cid in autoChannels" :key="cid">
+              <tr><td class="mono" style="color:var(--cyan)" x-text="cid"></td><td><button class="btn btn-err" style="padding:3px 8px;font-size:10px" @click="removeAutoChannel(cid)">Disable</button></td></tr>
+            </template>
+          </tbody>
+        </table>
+        <div x-show="autoChannels.length===0" class="muted" style="padding:16px;text-align:center">No auto channels.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Chat Room ═══ -->
+  <template x-if="tab==='Chat Room'">
+    <div>
+      <div class="msg" :class="msgType+' show'" x-text="msg" x-show="msg"></div>
+      <div class="grid-2">
+        <div class="card" style="max-height:560px;display:flex;flex-direction:column">
+          <h2>Select Channel</h2>
+          <div style="flex:1;overflow-y:auto" @scroll.passive="onChanScroll">
+            <template x-for="ch in channels" :key="ch.id">
+              <div class="chan-row" @click="loadChatHistory(ch.id)" :style="selectedChatChannel===ch.id?'background:rgba(0,229,255,.06);border-left:2px solid var(--cyan)':''">
+                <div><span class="chan-id">#<span x-text="ch.id"></span></span><div class="muted" style="font-size:10px" x-text="ch.messages+' msgs'"></div></div>
+                <div class="muted" style="font-size:10px" x-text="ch.last?new Date(ch.last).toLocaleTimeString():'-'"></div>
+              </div>
+            </template>
+            <div x-show="channels.length===0" class="muted" style="padding:16px;text-align:center">No channels.</div>
+          </div>
+        </div>
+        <div class="card" style="display:flex;flex-direction:column;min-height:560px">
+          <h2>Chat Viewer</h2>
+          <template x-if="selectedChatChannel">
+            <div style="display:flex;flex-direction:column;flex:1">
+              <div class="chat-area" x-ref="chatArea">
+                <template x-if="chatLoading"><div class="muted">Loading...</div></template>
+                <template x-if="!chatLoading && chatHistoryMessages.length===0"><div class="muted">No messages.</div></template>
+                <template x-for="msg in chatHistoryMessages" :key="msg.message_id||msg.timestamp">
+                  <div class="chat-msg">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+                      <span class="chat-author" :class="msg.author==='Maxwell'||msg.author_id==='1471821513824014480'?'bot':'user'" x-text="msg.author"></span>
+                      <span class="chat-time" x-text="new Date(msg.timestamp).toLocaleString()"></span>
+                    </div>
+                    <div style="white-space:pre-wrap;word-break:break-word;font-family:var(--sans)" x-text="msg.content"></div>
+                  </div>
+                </template>
+              </div>
+              <div class="chat-input-row">
+                <input x-model="newChatMessage" @keydown.enter="sendChatMessage()" placeholder="Type as Maxwell..." style="flex:1">
+                <button class="btn btn-cyan" @click="sendChatMessage()">Send</button>
+              </div>
+            </div>
+          </template>
+          <template x-if="!selectedChatChannel"><div class="muted" style="padding:40px;text-align:center">Select a channel to start chatting.</div></template>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Channels ═══ -->
+  <template x-if="tab==='Channels'">
+    <div>
+      <div class="card">
+        <h2>Tracked Channels</h2>
+        <div class="muted" style="margin-bottom:8px">Click a channel ID to copy it.</div>
+        <template x-for="ch in channels" :key="ch.id">
+          <div class="chan-row" @click="navigator.clipboard.writeText(ch.id);showMsg('Copied '+ch.id,'ok')">
+            <div><span class="chan-id" style="cursor:pointer">#<span x-text="ch.id"></span></span> <span class="muted" x-text="ch.messages+' msgs'"></span></div>
+            <div class="muted" x-text="ch.last?new Date(ch.last).toLocaleString():'-'"></div>
+          </div>
+        </template>
+        <div x-show="channels.length===0" class="muted" style="padding:16px;text-align:center">No channels.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Logs ═══ -->
+  <template x-if="tab==='Logs'">
+    <div>
+      <div class="card">
+        <h2>PM2 Logs</h2>
+        <div class="row" style="margin-bottom:8px">
+          <select x-model="logProcess" style="width:160px"><option value="maxwell-bot">maxwell-bot</option><option value="maxwell-api">maxwell-api</option></select>
+          <select x-model="logLines" style="width:100px"><option value="30">30 lines</option><option value="100">100</option><option value="200">200</option><option value="500">500</option></select>
+          <button class="btn btn-cyan" @click="loadLogs()">Load</button>
+          <button class="btn btn-err" @click="logViewer=''">Clear</button>
+        </div>
+        <div class="log-viewer" x-text="logViewer" x-show="logViewer"></div>
+        <div x-show="!logViewer" class="muted" style="padding:10px">Select a process and click Load to view logs.</div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ Raw Data ═══ -->
+  <template x-if="tab==='Raw Data'">
+    <div>
+      <div class="card"><h2>memory.json</h2><pre x-text="JSON.stringify(memoryJson,null,2)"></pre></div>
+      <div class="card"><h2>sites.json</h2><pre x-text="JSON.stringify(sites,null,2)"></pre></div>
+      <div class="card"><h2>prompts.json</h2><pre x-text="JSON.stringify(prompts,null,2)"></pre></div>
+      <div class="card"><h2>blacklist.json</h2><pre x-text="JSON.stringify(blacklist,null,2)"></pre></div>
+      <div class="card"><h2>auto_channels.json</h2><pre x-text="JSON.stringify(autoChannels,null,2)"></pre></div>
+      <div class="card"><h2>bot_control.json</h2><pre x-text="JSON.stringify(control,null,2)"></pre></div>
+    </div>
+  </template>
+</main>
+</div>
+
+<script>
+function adminPanel(){
+  return{
+    tabs:['Overview','Actions','Chat Room','Controls','Memory','Sites','Prompts','Blacklist','Auto Chan','Channels','Logs','Raw Data'],
+    tabIcons:{'Overview':'📊','Actions':'⚡','Chat Room':'💬','Controls':'⚙️','Memory':'🧠','Sites':'🌐','Prompts':'📝','Blacklist':'🚫','Auto Chan':'🔔','Channels':'📡','Logs':'📋','Raw Data':'🔍'},
+    tab:'Overview',
+    stats:{guilds:0,channels:0,memories:0,sites:0,blacklist:0,prompts:0,autoChannels:0,online:true},
+    memories:[],sites:{},prompts:{},blacklist:[],autoChannels:[],memoryJson:{},tools:[],
+    selectedChatChannel:'',chatHistoryMessages:[],newChatMessage:'',chatLoading:false,
+    channels:[],
+    pm2:{bot:null,api:null},
+    logProcess:'maxwell-bot',logLines:'100',logViewer:'',
+    control:{bot_enabled:true,log_messages:false,error_replies:true,typing_indicator:true,store_memory:false,long_term_memory_enabled:true,emoji_context_enabled:true,music_context_enabled:true,reply_dms:false,reply_groups:false,reply_mentions:true,reply_to_bots:false,auto_mode_enabled:false,auto_eval_every:5,auto_max_recent_replies:5,auto_recent_window_minutes:10,auto_inactivity_minutes:30,per_user_cooldown_seconds:1.5,process_images:true,max_image_size_mb:10,ai_timeout_seconds:180,ai_concurrency:3,memory_history_messages:20,memory_context_budget:30000,max_tool_iterations:10,max_response_chars:500,tools_enabled:false,disabled_tools:[],ignore_users:[],allowed_channels:[],blocked_channels:[],disabled_commands:[],base_personality:'',auto_decider_prompt:''},
+    listText:{ignore_users:'',allowed_channels:'',blocked_channels:'',disabled_commands:''},
+    memFilter:'',newMemory:'',newPromptId:'',newPromptText:'',newBlacklistId:'',newAutoChannelId:'',adminUser:'',adminPass:'',
+    msg:'',msgType:'',
+    actionChannelId:'',actionMessage:'',actionDmUserId:'',actionDmMessage:'',
+    actionStatus:'online',actionActivityType:'',actionActivityText:'',
+    actionCustomStatus:'',actionAvatarUrl:'',actionShellCmd:'',actionShellResult:'',
+    actionClearChannelId:'',commandHistory:[],
+    async init(){
+      this.adminUser=localStorage.getItem('maxwellAdminUser')||'';
+      await this.loadAll();
+      setInterval(()=>this.loadAll(),30000);
+    },
+    saveLogin(){
+      this.adminUser=this.adminUser.trim();
+      localStorage.setItem('maxwellAdminUser',this.adminUser);
+      this.apiFetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:this.adminUser,pass:this.adminPass})})
+        .then(d=>{if(d.ok)this.showMsg('Login valid for this tab','ok');else this.showMsg('Error: '+(d.error||'unknown'),'err')})
+        .catch(e=>this.showMsg('Error: '+e.message,'err'));
+    },
+    clearLogin(){
+      localStorage.removeItem('maxwellAdminUser');
+      this.adminUser='';this.adminPass='';this.showMsg('Login cleared','ok');
+    },
+    async apiFetch(url,options={}){
+      const headers=Object.assign({},options.headers||{});
+      if(this.adminUser||this.adminPass)headers.Authorization='Basic '+btoa(this.adminUser+':'+this.adminPass);
+      const res=await fetch(url,Object.assign({},options,{headers}));
+      let data=null;try{data=await res.json();}catch(e){data={};}
+      if(!res.ok){throw new Error(data.error||('HTTP '+res.status));}
+      return data;
+    },
+    async loadAll(){
+      try{
+        const[ltm,m,s,p,b,a,c,statusData,chData]=await Promise.all([
+          this.apiFetch('/data/long_term_memory.json').catch(()=>[]),
+          this.apiFetch('/data/memory.json').catch(()=>({})),
+          this.apiFetch('/data/sites.json').catch(()=>({})),
+          this.apiFetch('/data/prompts.json').catch(()=>({})),
+          this.apiFetch('/data/blacklist.json').catch(()=>[]),
+          this.apiFetch('/data/auto_channels.json').catch(()=>[]),
+          this.apiFetch('/data/bot_control.json').catch(()=>({})),
+          this.apiFetch('/api/status').catch(()=>null),
+          this.apiFetch('/api/channels').catch(()=>[])
+        ]);
+        this.memoryJson=(m&&typeof m==='object'&&!Array.isArray(m))?m:{};
+        const memArr=Array.isArray(ltm)?ltm.map((x,i)=>({id:x.id??i+1,content:x.content??x})):[];
+        this.memories=memArr;
+        this.sites=(s&&typeof s==='object'&&!Array.isArray(s))?s:{};
+        this.prompts=(p&&typeof p==='object'&&!Array.isArray(p))?p:{};
+        this.blacklist=Array.isArray(b)?b:[];
+        this.autoChannels=Array.isArray(a)?a.map(String):[];
+        this.channels=Array.isArray(chData)?chData:[];
+        if(c&&typeof c==='object'){
+          if(c.control&&typeof c.control==='object'){this.control=Object.assign({},this.control,c.control);this.syncListTextFromControl();}
+          if(Array.isArray(c.tools))this.tools=c.tools;
+        }
+        if(statusData&&typeof statusData==='object'){
+          this.stats.online=!!statusData.online;
+          this.stats.guilds=Object.keys(this.prompts).length;
+          this.stats.channels=statusData.stats?.channels??Object.keys(this.memoryJson).length;
+          this.stats.memories=memArr.length;
+          this.stats.sites=Object.keys(this.sites).length;
+          this.stats.blacklist=this.blacklist.length;
+          this.stats.prompts=Object.keys(this.prompts).length;
+          this.stats.autoChannels=this.autoChannels.length;
+          this.pm2.bot=statusData.pm2?.bot||null;
+          this.pm2.api=statusData.pm2?.api||null;
+        }else{
+          this.stats.guilds=Object.keys(this.prompts).length;
+          this.stats.channels=Object.keys(this.memoryJson).length;
+          this.stats.memories=memArr.length;
+          this.stats.sites=Object.keys(this.sites).length;
+          this.stats.blacklist=this.blacklist.length;
+          this.stats.prompts=Object.keys(this.prompts).length;
+          this.stats.autoChannels=this.autoChannels.length;
+          this.stats.online=false;
+        }
+      }catch(e){console.error(e);this.stats.online=false;}
+    },
+    filteredMemories(){const q=this.memFilter.toLowerCase();if(!q)return this.memories;return this.memories.filter(m=>(m.content+' '+m.id).toLowerCase().includes(q))},
+    async loadChatHistory(channelId){
+      this.selectedChatChannel=channelId;this.chatLoading=true;
+      try{const data=await this.apiFetch('/api/chat/history?channel_id='+encodeURIComponent(channelId));this.chatHistoryMessages=Array.isArray(data)?data:[];}catch(e){this.showMsg('Error: '+e.message,'err');}
+      this.chatLoading=false;
+    },
+    async sendChatMessage(){
+      if(!this.newChatMessage.trim()){this.showMsg('Empty message','err');return;}
+      const content=this.newChatMessage;this.newChatMessage='';
+      try{
+        await this.apiFetch('/api/commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'send_message',channel_id:this.selectedChatChannel,content:content})});
+        this.showMsg('Message queued','ok');
+        this.chatHistoryMessages.push({author:'Maxwell (pending)',author_id:'1471821513824014480',content:content,timestamp:new Date().toISOString()});
+        setTimeout(()=>this.loadChatHistory(this.selectedChatChannel),1500);
+      }catch(e){this.showMsg('Error: '+e.message,'err');}
+    },
+    siteAge(ts){if(!ts)return'?';const h=Math.round((Date.now()/1000-ts)/3600);if(h<1)return Math.round((Date.now()/1000-ts)/60)+'m';if(h<24)return h+'h';return Math.round(h/24)+'d'},
+    siteRemaining(ts){if(!ts)return'?';const left=Math.max(0,86400-(Date.now()/1000-ts));return Math.floor(left/3600)+'h '+Math.floor((left%3600)/60)+'m'},
+    formatUptime(ts){if(!ts)return'-';const ms=Date.now()-ts;const s=Math.floor(ms/1000);const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);const m=Math.floor((s%3600)/60);if(d>0)return d+'d '+h+'h';if(h>0)return h+'h '+m+'m';return m+'m'},
+    showMsg(text,type){this.msg=text;this.msgType=type;setTimeout(()=>{this.msg=''},3000)},
+    isToolDisabled(tool){return Array.isArray(this.control.disabled_tools)&&this.control.disabled_tools.includes(tool)},
+    toggleTool(tool){if(!Array.isArray(this.control.disabled_tools))this.control.disabled_tools=[];if(this.isToolDisabled(tool)){this.control.disabled_tools=this.control.disabled_tools.filter(t=>t!==tool)}else{this.control.disabled_tools=[...this.control.disabled_tools,tool]}},
+    syncListTextFromControl(){for(const key of['ignore_users','allowed_channels','blocked_channels','disabled_commands']){this.listText[key]=Array.isArray(this.control[key])?this.control[key].join('\n'):''}},
+    syncControlLists(){for(const key of['ignore_users','allowed_channels','blocked_channels','disabled_commands']){this.control[key]=(this.listText[key]||'').split(/\n|,/).map(x=>x.trim()).filter(Boolean)}},
+    async saveControl(){
+      try{this.syncControlLists();const data=await this.apiFetch('/api/control',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(this.control)});if(data.control){this.control=data.control;this.syncListTextFromControl();}this.showMsg('Controls saved','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}
+    },
+    async resetControl(){
+      try{const data=await this.apiFetch('/api/control',{method:'DELETE'});if(data.control){this.control=data.control;this.syncListTextFromControl();}this.showMsg('Reset to defaults','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}
+    },
+    async addMemory(){if(!this.newMemory.trim()){this.showMsg('Empty','err');return;}try{await this.apiFetch('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:this.newMemory})});this.newMemory='';await this.loadAll();this.showMsg('Memory added','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async saveMemory(m){if(!String(m.content||'').trim()){this.showMsg('Empty','err');return;}try{await this.apiFetch('/api/memory',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:m.id,content:m.content})});await this.loadAll();this.showMsg('Saved','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async deleteMemory(id){try{await this.apiFetch('/api/memory?id='+encodeURIComponent(id),{method:'DELETE'});await this.loadAll();this.showMsg('Deleted','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async savePrompt(id){try{await this.apiFetch('/api/prompts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,text:this.prompts[id]})});this.showMsg('Saved','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async deletePrompt(id){try{await this.apiFetch('/api/prompts?id='+encodeURIComponent(id),{method:'DELETE'});await this.loadAll();this.showMsg('Deleted','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async addPrompt(){if(!this.newPromptId.trim()||!this.newPromptText.trim()){this.showMsg('Need ID and text','err');return;}try{await this.apiFetch('/api/prompts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:this.newPromptId,text:this.newPromptText})});this.newPromptId='';this.newPromptText='';await this.loadAll();this.showMsg('Added','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async addBlacklist(){if(!this.newBlacklistId.trim()){this.showMsg('Empty ID','err');return;}try{await this.apiFetch('/api/blacklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:this.newBlacklistId})});this.newBlacklistId='';await this.loadAll();this.showMsg('Blocked','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async removeBlacklist(id){try{await this.apiFetch('/api/blacklist?id='+encodeURIComponent(id),{method:'DELETE'});await this.loadAll();this.showMsg('Removed','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async addAutoChannel(){if(!this.newAutoChannelId.trim()){this.showMsg('Empty ID','err');return;}try{await this.apiFetch('/api/auto_channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:this.newAutoChannelId})});this.newAutoChannelId='';await this.loadAll();this.showMsg('Enabled','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async removeAutoChannel(id){try{await this.apiFetch('/api/auto_channels?id='+encodeURIComponent(id),{method:'DELETE'});await this.loadAll();this.showMsg('Disabled','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async saveSite(slug,s){try{await this.apiFetch('/api/sites',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug,title:s.title})});await this.loadAll();this.showMsg('Saved','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async runAction(type,params){try{await this.apiFetch('/api/commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({type},params))});this.showMsg('Command queued','ok');if(type==='shell')setTimeout(()=>this.loadCommands(),2000)}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async loadCommands(){try{const cmds=await this.apiFetch('/api/commands',{method:'GET'});if(Array.isArray(cmds)){this.commandHistory=cmds.reverse();const sh=cmds.find(c=>c.type==='shell'&&c.status==='done'&&c.result);if(sh)this.actionShellResult=sh.result}}catch(e){}},
+    async deleteCommand(id){try{await this.apiFetch('/api/commands?id='+encodeURIComponent(id),{method:'DELETE'});await this.loadCommands();this.showMsg('Deleted','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async extendSite(slug){try{await this.apiFetch('/api/sites',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug,extend_24h:true})});await this.loadAll();this.showMsg('Extended','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async deleteSite(slug){try{await this.apiFetch('/api/sites?slug='+encodeURIComponent(slug),{method:'DELETE'});await this.loadAll();this.showMsg('Deleted','ok')}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async restartPm2(target){try{const data=await this.apiFetch('/api/pm2/restart?target='+encodeURIComponent(target),{method:'POST'});this.showMsg('Restart sent for '+target,'ok');setTimeout(()=>this.loadAll(),3000)}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    async loadLogs(){try{const data=await this.apiFetch('/api/pm2/logs?process='+encodeURIComponent(this.logProcess)+'&lines='+encodeURIComponent(this.logLines),{method:'GET'});if(data.log)this.logViewer=data.log;else this.logViewer='No logs returned.'}catch(e){this.showMsg('Error: '+e.message,'err')}},
+    onChanScroll(){}
+  }
+}
+</script>
+</body>
+</html>

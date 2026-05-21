@@ -1,0 +1,1435 @@
+"""Tools for Maxwell Bot
+
+All tools return a result string for the LLM. They do NOT send errors
+to the Discord channel — errors are returned as strings so the LLM can
+generate a natural response. Only success outputs (images, DMs) are
+sent directly to their target.
+"""
+
+import ipaddress
+import json
+import os
+import re
+from pathlib import Path
+
+import asyncio
+import base64
+import discord
+import aiohttp
+import aiofiles
+import logging
+import random
+from datetime import datetime, timezone, timedelta
+from discord import Message, File, Activity, Status
+from io import BytesIO
+from urllib.parse import quote, urlparse
+from tools import Tool
+from ddgs import DDGS as _DDGS
+
+logger = logging.getLogger(__name__)
+
+OWNER_IDS = {"1471821513824014480"}
+
+_SHARED_SESSION: aiohttp.ClientSession = None
+
+
+def _is_safe_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+class _SafeResolver(aiohttp.abc.AbstractResolver):
+    """Resolver that blocks private/internal addresses at request time."""
+
+    def __init__(self):
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=0):
+        results = await self._resolver.resolve(host, port, family)
+        for item in results:
+            if not _is_safe_ip(item["host"]):
+                raise OSError(f"blocked unsafe resolved address for {host}")
+        return results
+
+    async def close(self):
+        await self._resolver.close()
+
+
+async def _get_shared_session() -> aiohttp.ClientSession:
+    global _SHARED_SESSION
+    if _SHARED_SESSION is None or _SHARED_SESSION.closed:
+        connector = aiohttp.TCPConnector(resolver=_SafeResolver())
+        _SHARED_SESSION = aiohttp.ClientSession(connector=connector)
+    return _SHARED_SESSION
+
+
+async def close_shared_session():
+    global _SHARED_SESSION
+    if _SHARED_SESSION and not _SHARED_SESSION.closed:
+        await _SHARED_SESSION.close()
+
+
+async def _read_response_limited(response: aiohttp.ClientResponse, max_bytes: int) -> bytes:
+    content_length = response.headers.get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise ValueError(f"response too large (max {max_bytes} bytes)")
+        except ValueError as exc:
+            if "response too large" in str(exc):
+                raise
+    chunks = []
+    total = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"response too large (max {max_bytes} bytes)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _is_safe_url(url: str) -> bool:
+    """Block SSRF: no private/loopback/link-local/localhost IPs."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # Block localhost names
+        if hostname.lower() in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            return False
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            return True
+        return _is_safe_ip(hostname)
+    except Exception:
+        return False
+
+
+class ImageGeneratorTool(Tool):
+    """Fast image generation using NVIDIA Flux"""
+
+    def get_description(self):
+        return (
+            "Generate an AI image FAST (~3s). Use this as the DEFAULT — quick, decent quality. "
+            "Only switch to hd_image when someone specifically asks for 'high quality', 'HD', 'HQ', or 'better quality'. "
+            "Params: prompt (required)."
+        )
+
+    async def execute(self, message: Message, prompt: str = None, **kwargs) -> str:
+        if not prompt:
+            return "Error: prompt parameter is required"
+        nvidia_key = self.bot.config.NVIDIA_API_KEY
+        if nvidia_key:
+            return await self._nvidia_generate(message, prompt)
+        return await self._pollinations_fallback(message, prompt)
+
+    async def _nvidia_generate(self, message: Message, prompt: str) -> str:
+        api_key = self.bot.config.NVIDIA_API_KEY
+        api_url = self.bot.config.NVIDIA_IMAGE_URL
+        payload = {
+            "prompt": prompt,
+            "mode": "base",
+            "cfg_scale": 3.5,
+            "width": 1024,
+            "height": 1024,
+            "seed": random.randint(0, 1000000),
+            "steps": 20,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        session = await _get_shared_session()
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                async with session.post(
+                    api_url, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as response:
+                    if response.status == 429:
+                        wait_time = (attempt + 1) * 10
+                        logger.warning(f"NVIDIA image rate limited, retry {attempt + 1}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    if 500 <= response.status < 600:
+                        error_text = await response.text()
+                        logger.warning(f"NVIDIA image server error {response.status}, retry {attempt + 1}/{max_retries}: {error_text[:200]}")
+                        wait_time = (attempt + 1) * 15
+                        await asyncio.sleep(wait_time)
+                        continue
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"NVIDIA image error: {response.status} - {error_text[:500]}")
+                        last_error = f"Error generating image: API returned status {response.status}. Try again later."
+                        break
+                    data = await response.json()
+                    if "artifacts" not in data or not data["artifacts"]:
+                        logger.error(f"NVIDIA image response missing artifacts: {list(data.keys())}")
+                        last_error = "Error: No image data in response"
+                        break
+                    artifact = data["artifacts"][0]
+                    image_b64 = artifact.get("base64")
+                    finish_reason = artifact.get("finishReason")
+                    if finish_reason != "SUCCESS" or not image_b64:
+                        logger.error(f"NVIDIA image artifact issue: finishReason={finish_reason}, base64_present={bool(image_b64)}")
+                        if finish_reason == "CONTENT_FILTERED":
+                            last_error = "Error: Image was filtered by safety guardrails. Try a different prompt."
+                        else:
+                            last_error = "Error: No base64 image data in response"
+                        break
+                    image_bytes = base64.b64decode(image_b64)
+                    logger.info(f"NVIDIA image generated successfully, size: {len(image_bytes)} bytes")
+                    file = File(BytesIO(image_bytes), filename="generated_image.png")
+                    try:
+                        await message.channel.send(file=file)
+                    except discord.Forbidden:
+                        logger.warning(f"Cannot send image in {message.channel.id} — missing permissions")
+                        return "Error: Cannot send image — missing permissions"
+                    await self.bot.memory.add_to_channel_memory(
+                        str(message.channel.id),
+                        {"author": "Tool", "content": f"Generated image: {prompt[:200]}", "is_tool": True},
+                    )
+                    return f"Image generated and sent successfully: {prompt[:100]}"
+            except asyncio.TimeoutError:
+                logger.warning(f"NVIDIA image timeout, attempt {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                last_error = "Error: Image generation timed out after retries"
+                break
+            except Exception as e:
+                logger.error(f"NVIDIA image generation error: {e}")
+                last_error = f"Error generating image: {e}"
+                break
+        if last_error:
+            return last_error
+        return "Error: Image generation failed after retries"
+
+    async def _pollinations_fallback(self, message: Message, prompt: str) -> str:
+        encoded_prompt = quote(prompt)
+        seed = str(random.randint(0, 1000000))
+        url = (
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            f"?model={self.bot.config.POLLINATIONS_MODEL}"
+            f"&seed={seed}&nologo=true&width=1024&height=1024"
+        )
+
+        session = await _get_shared_session()
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as response:
+                if response.status != 200:
+                    return f"Error generating image: API returned status {response.status}"
+                image_bytes = await _read_response_limited(response, 25 * 1024 * 1024)
+                file = File(BytesIO(image_bytes), filename="generated_image.png")
+                try:
+                    await message.channel.send(file=file)
+                except discord.Forbidden:
+                    logger.warning(f"Cannot send fallback image in {message.channel.id} — missing permissions")
+                    return "Error: Cannot send image — missing permissions"
+                await self.bot.memory.add_to_channel_memory(
+                    str(message.channel.id),
+                    {"author": "Tool", "content": f"Generated image: {prompt[:200]}", "is_tool": True},
+                )
+                return f"Image generated and sent successfully: {prompt[:100]}"
+        except Exception as e:
+            logger.error(f"Pollinations fallback error: {e}")
+            return f"Error generating image: {e}"
+
+
+class HDImageGeneratorTool(Tool):
+    """HD image generation using GPT-Image-2 (slower, better quality)"""
+
+    def get_description(self):
+        return (
+            "Generate an HD AI image (~40s). Use ONLY when the user explicitly asks for 'high quality', 'HD', 'HQ', 'better quality', or similar. "
+            "Otherwise default to image_generator (fast/normal). Params: prompt (required), size (optional, e.g. '1024x1024')."
+        )
+
+    async def execute(self, message: Message, prompt: str = None, size: str = "1024x1024", **kwargs) -> str:
+        if not prompt:
+            return "Error: prompt parameter is required"
+
+        api_url = getattr(self.bot.config, "GPT_IMAGE_URL", "")
+        api_key = getattr(self.bot.config, "GPT_IMAGE_API_KEY", "")
+        if not api_url or not api_key:
+            return "Error: HD image generation is not configured (missing GPT_IMAGE_URL or GPT_IMAGE_API_KEY)"
+
+        payload = {
+            "model": "gpt-image-2",
+            "prompt": prompt,
+            "size": size,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        session = await _get_shared_session()
+        image_url = None
+        revised_prompt = None
+
+        try:
+            async with session.post(
+                api_url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"HD image API error: {response.status} - {error_text[:500]}")
+                    return f"Error generating HD image: API returned status {response.status}"
+                data = await response.json()
+                if "data" not in data or not data["data"]:
+                    logger.error(f"HD image response missing data: {list(data.keys())}")
+                    return "Error: No image data in HD response"
+                item = data["data"][0]
+                image_url = item.get("url")
+                revised_prompt = item.get("revised_prompt")
+                if not image_url:
+                    return "Error: No image URL in HD response"
+        except asyncio.TimeoutError:
+            logger.warning("HD image generation timed out")
+            return "Error: HD image generation timed out after 120s"
+        except Exception as e:
+            logger.error(f"HD image generation request error: {e}")
+            return f"Error generating HD image: {e}"
+
+        if not _is_safe_url(image_url):
+            return "Error: HD image service returned an unsafe image URL"
+
+        # Fetch the actual PNG from the returned URL
+        try:
+            async with session.get(
+                image_url,
+                timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
+            ) as img_resp:
+                if img_resp.status != 200:
+                    logger.error(f"HD image download error: {img_resp.status} for {image_url}")
+                    return f"Error: Could not download HD image (status {img_resp.status})"
+                image_bytes = await _read_response_limited(img_resp, 25 * 1024 * 1024)
+        except asyncio.TimeoutError:
+            logger.warning(f"HD image download timed out for {image_url}")
+            return "Error: Timed out downloading HD image"
+        except Exception as e:
+            logger.error(f"HD image download error: {e}")
+            return f"Error downloading HD image: {e}"
+
+        file = File(BytesIO(image_bytes), filename="hd_generated_image.png")
+        try:
+            await message.channel.send(file=file)
+        except discord.Forbidden:
+            logger.warning(f"Cannot send HD image in {message.channel.id} — missing permissions")
+            return "Error: Cannot send HD image — missing permissions"
+
+        await self.bot.memory.add_to_channel_memory(
+            str(message.channel.id),
+            {"author": "Tool", "content": f"Generated HD image: {revised_prompt or prompt[:200]}", "is_tool": True},
+        )
+        return f"HD image generated and sent successfully: {(revised_prompt or prompt)[:100]}"
+
+
+class SendDMTool(Tool):
+    """Send a DM to a user on behalf of the bot"""
+
+    def get_description(self):
+        return (
+            "DM a user. They MUST have messaged you first — no cold DMs (Discord blocks them). "
+            "Params: user_id (required), text (required)."
+        )
+
+    async def execute(
+        self, message: Message, user_id: str = None, text: str = None, **kwargs
+    ) -> str:
+        if not user_id:
+            return "Error: user_id is required"
+        if not text:
+            return "Error: text is required"
+
+        try:
+            user = await self.bot.fetch_user(int(user_id))
+            if not user:
+                return f"Error: User {user_id} not found"
+
+            dm_channel = user.dm_channel
+            if dm_channel is None:
+                dm_channel = await user.create_dm()
+
+            dm_channel_id = str(dm_channel.id)
+            existing_memory = await self.bot.memory.get_channel_memory(dm_channel_id)
+            if not existing_memory:
+                return (
+                    f"Cannot DM {user.display_name} — they haven't messaged me "
+                    f"first. Discord requires the user to initiate the DM to "
+                    f"avoid captcha. Tell the user they need to DM me first, "
+                    f"then I can reply."
+                )
+
+            await dm_channel.send(text)
+
+            if not isinstance(message.channel, discord.DMChannel):
+                channel_id = str(message.channel.id)
+                recent = await self.bot.memory.get_channel_memory(channel_id)
+                if recent:
+                    context_lines = []
+                    for msg in recent[-5:]:
+                        author = msg.get("author", "?")
+                        content = msg.get("content", "")
+                        if msg.get("is_tool"):
+                            context_lines.append(f"[{content[:150]}]")
+                        else:
+                            context_lines.append(f"{author}: {content[:150]}")
+                    channel_name = getattr(message.channel, "name", "unknown")
+                    guild_name = message.guild.name if message.guild else "Group"
+                    context_summary = (
+                        f"[CONTEXT: I DM'd {user.display_name} from "
+                        f"#{channel_name} in {guild_name}. "
+                        f"Recent server messages: "
+                        + " | ".join(context_lines) + "]"
+                    )
+                    await self.bot.memory.add_to_channel_memory(
+                        dm_channel_id,
+                        {
+                            "author": "System",
+                            "content": context_summary[:500],
+                            "is_tool": True,
+                        },
+                    )
+
+            await self.bot.memory.add_to_channel_memory(
+                dm_channel_id,
+                {
+                    "author": self.bot.bot_name,
+                    "content": text,
+                    "is_tool": True,
+                },
+            )
+
+            if not isinstance(message.channel, discord.DMChannel):
+                channel_id = str(message.channel.id)
+                await self.bot.memory.add_to_channel_memory(
+                    channel_id,
+                    {
+                        "author": "Tool",
+                        "content": f"Sent DM to {user.display_name} (ID: {user_id}): {text[:200]}",
+                        "is_tool": True,
+                    },
+                )
+
+            logger.info(f"Sent DM to {user.display_name} ({user_id})")
+            return f"DM sent to {user.display_name}: {text[:100]}"
+
+        except discord.NotFound:
+            return f"Error: User {user_id} not found on Discord"
+        except discord.Forbidden:
+            return f"Error: Cannot DM user {user_id} — they may have blocked me"
+        except ValueError:
+            return f"Error: Invalid user_id: {user_id}"
+        except Exception as e:
+            if "captcha" in str(e).lower():
+                logger.warning(f"Captcha required when DMing {user_id}")
+                return (
+                    f"Error: Discord captcha triggered when trying to DM "
+                    f"{user_id}. They need to message me first, then I can reply."
+                )
+            logger.error(f"DM tool error: {e}")
+            return f"Error sending DM: {e}"
+
+
+class MemoryTool(Tool):
+    """Manage long-term persistent memories"""
+
+    def get_description(self):
+        return (
+            "Manage long-term memories (persist across all conversations). "
+            "Only store important facts/preferences/context — no logs or trivia. "
+            "Actions: add (content), edit (memory_id, content), remove (memory_id)."
+        )
+
+    async def execute(
+        self, message: Message, action: str = None, content: str = None,
+        memory_id: str = None, **kwargs
+    ) -> str:
+        if not action:
+            return "Error: action is required (add/edit/remove)"
+
+        action = action.lower()
+
+        if action == "add":
+            if not content:
+                return "Error: content is required for add"
+            new_id = await self.bot.memory.add_long_term_memory(content)
+            logger.info(f"Added long-term memory #{new_id}")
+            return f"Memory #{new_id} saved successfully"
+
+        elif action == "edit":
+            if not memory_id or not content:
+                return "Error: memory_id and content are required for edit"
+            found = await self.bot.memory.edit_long_term_memory(memory_id, content)
+            if found:
+                return f"Memory #{memory_id} updated successfully"
+            return f"Error: Memory #{memory_id} not found"
+
+        elif action == "remove":
+            if not memory_id:
+                return "Error: memory_id is required for remove"
+            found = await self.bot.memory.remove_long_term_memory(memory_id)
+            if found:
+                return f"Memory #{memory_id} removed successfully"
+            return f"Error: Memory #{memory_id} not found"
+
+        return f"Error: Unknown action '{action}'. Use add/edit/remove"
+
+
+class ReactTool(Tool):
+    """React to a message with an emoji"""
+
+    def get_description(self):
+        return (
+            "React to the current message with an emoji. "
+            "Standard emoji: 👍 🐱 🔥. Custom emoji: use name like dave, pepe, catjam. "
+            "Params: emoji (required)."
+        )
+
+    async def execute(self, message: Message, emoji: str = None, **kwargs) -> str:
+        if not emoji:
+            return "Error: emoji parameter is required"
+
+        # Try custom emoji by name from the message's guild
+        lookup = emoji.strip().lower()
+        guild_id = str(message.guild.id) if message.guild else None
+        if guild_id:
+            guild_emojis = self.bot._guild_emojis.get(guild_id, {})
+            if lookup in guild_emojis:
+                emoji_str = guild_emojis[lookup]
+                for e in message.guild.emojis:
+                    if e.name.lower() == lookup:
+                        try:
+                            await message.add_reaction(e)
+                            return f"Reacted with {emoji_str}"
+                        except discord.HTTPException as ex:
+                            return f"Error: Could not add reaction — {ex}"
+
+        # Fallback: try the emoji string directly (unicode or <:name:id> format)
+        try:
+            await message.add_reaction(emoji)
+            return f"Reacted with {emoji}"
+        except discord.NotFound:
+            return f"Error: Emoji '{emoji}' not found or invalid"
+        except discord.HTTPException as e:
+            return f"Error: Could not add reaction — {e}"
+
+
+class EditMessageTool(Tool):
+    """Edit one of the bot's own messages"""
+
+    def get_description(self):
+        return "Edit your own message. Params: message_id (required), content (required, new text)."
+
+    async def execute(
+        self, message: Message, message_id: str = None, content: str = None, **kwargs
+    ) -> str:
+        if not message_id or not content:
+            return "Error: message_id and content are required"
+        try:
+            msg = await message.channel.fetch_message(int(message_id))
+            if msg.author.id != self.bot.user.id:
+                return "Error: I can only edit my own messages"
+            await msg.edit(content=content)
+            return f"Message {message_id} edited successfully"
+        except discord.NotFound:
+            return f"Error: Message {message_id} not found"
+        except discord.Forbidden:
+            return "Error: I don't have permission to edit that message"
+        except Exception as e:
+            return f"Error editing message: {e}"
+
+
+class DeleteMessageTool(Tool):
+    """Delete one of the bot's own messages"""
+
+    def get_description(self):
+        return "Delete your own message. Params: message_id (required)."
+
+    async def execute(self, message: Message, message_id: str = None, **kwargs) -> str:
+        if not message_id:
+            return "Error: message_id is required"
+        try:
+            msg = await message.channel.fetch_message(int(message_id))
+            if msg.author.id != self.bot.user.id:
+                return "Error: I can only delete my own messages"
+            await msg.delete()
+            return f"Message {message_id} deleted"
+        except discord.NotFound:
+            return f"Error: Message {message_id} not found"
+        except discord.Forbidden:
+            return "Error: I don't have permission to delete that message"
+        except Exception as e:
+            return f"Error deleting message: {e}"
+
+
+class ChangePresenceTool(Tool):
+    """Change bot online status"""
+
+    def get_description(self):
+        return "Set your online status. Params: status (online/idle/dnd/invisible)."
+
+    async def execute(self, message: Message, status: str = "online", **kwargs) -> str:
+        valid = ["online", "idle", "dnd", "invisible"]
+        if status not in valid:
+            return f"Error: status must be one of {', '.join(valid)}"
+        status_obj = getattr(Status, status, Status.online)
+        activities = self.bot._build_activities()
+        await self.bot.change_presence(status=status_obj, activities=activities, edit_settings=bool(self.bot._custom_status))
+        return f"Status set to {status}"
+
+
+class SetActivityTool(Tool):
+    """Set bot activity/custom status"""
+
+    def get_description(self):
+        return (
+            "Set your activity or custom status message (the text under your name). "
+            "Params: type (playing/watching/listening/competing/custom), text (the status text), "
+            "elapsed (optional, show time played, e.g. '2h 30m' or '45m'). "
+            "Use type='custom' for a plain status message like 'chilling'. "
+            "Setting a game activity keeps your custom status intact. "
+            "Call with text='' to clear."
+        )
+
+    def _parse_elapsed(self, elapsed: str) -> int:
+        import re as _re
+        total_ms = 0
+        for match in _re.finditer(r"(\d+)\s*(h|m|s|d)", elapsed.lower()):
+            val = int(match.group(1))
+            unit = match.group(2)
+            if unit == "d":
+                total_ms += val * 86400000
+            elif unit == "h":
+                total_ms += val * 3600000
+            elif unit == "m":
+                total_ms += val * 60000
+            elif unit == "s":
+                total_ms += val * 1000
+        if total_ms == 0:
+            try:
+                total_ms = int(elapsed) * 60000
+            except ValueError:
+                total_ms = 0
+        return total_ms
+
+    async def execute(self, message: Message, type: str = None, text: str = None, elapsed: str = None, **kwargs) -> str:
+        activity_type = (type or "custom").lower()
+
+        if not text:
+            if activity_type == "custom":
+                self.bot._custom_status = None
+            else:
+                self.bot._current_game = None
+            activities = self.bot._build_activities()
+            if not activities:
+                await self.bot.change_presence(activity=None, edit_settings=True)
+            else:
+                await self.bot.change_presence(activities=activities, edit_settings=bool(self.bot._custom_status))
+            return "Cleared"
+
+        if activity_type == "custom":
+            self.bot._custom_status = discord.CustomActivity(name=text, state=text)
+        elif activity_type in ("playing", "watching", "listening", "competing"):
+            act_kwargs = {
+                "type": getattr(discord.ActivityType, activity_type),
+                "name": text,
+            }
+            if elapsed:
+                ms = self._parse_elapsed(elapsed)
+                if ms > 0:
+                    start_time = datetime.now(timezone.utc) - timedelta(milliseconds=ms)
+                    act_kwargs["timestamps"] = discord.ActivityTimestamps(start=start_time)
+            self.bot._current_game = Activity(**act_kwargs)
+        else:
+            return "Error: type must be playing/watching/listening/competing/custom"
+
+        activities = self.bot._build_activities()
+        await self.bot.change_presence(activities=activities, edit_settings=bool(self.bot._custom_status))
+        if activity_type == "custom":
+            return f"Custom status set: {text}"
+        elapsed_str = f" ({elapsed} elapsed)" if elapsed else ""
+        return f"Activity set: {activity_type} {text}{elapsed_str}"
+
+
+class CreatePollTool(Tool):
+    """Create a poll in the channel"""
+
+    def get_description(self):
+        return (
+            "Create a poll. Params: question (required), options (required, comma-separated, e.g. 'Yes,No,Maybe'), "
+            "duration_hours (optional, default 24)."
+        )
+
+    async def execute(
+        self, message: Message, question: str = None, options: str = None,
+        duration_hours: str = "24", **kwargs
+    ) -> str:
+        if not question or not options:
+            return "Error: question and options are required"
+        try:
+            option_list = [o.strip() for o in options.split(",") if o.strip()]
+            if len(option_list) < 2:
+                return "Error: Need at least 2 options for a poll"
+            if len(option_list) > 10:
+                return "Error: Maximum 10 options allowed"
+
+            import datetime
+            hours = int(duration_hours)
+            if hours < 1 or hours > 168:
+                return "Error: duration_hours must be between 1 and 168"
+            poll = discord.Poll(
+                question=question,
+                duration=datetime.timedelta(hours=hours),
+            )
+            for opt in option_list:
+                poll.add_answer(text=opt)
+
+            await message.channel.send(poll=poll)
+            return f"Poll created: '{question}' with options: {', '.join(option_list)}"
+        except ValueError:
+            return "Error: duration_hours must be a number"
+        except Exception as e:
+            return f"Error creating poll: {e}"
+
+
+class CreateInviteTool(Tool):
+    """Create an invite link for the server"""
+
+    def get_description(self):
+        return (
+            "Create a server invite link. Only works in servers. "
+            "Params: max_uses (optional, 0=unlimited), max_age (optional, seconds, default 86400)."
+        )
+
+    async def execute(
+        self, message: Message, max_uses: str = "0", max_age: str = "86400", **kwargs
+    ) -> str:
+        if not message.guild:
+            return "Error: Cannot create invites in DMs"
+        try:
+            uses = int(max_uses)
+            age = int(max_age)
+            if uses < 0 or uses > 100:
+                return "Error: max_uses must be between 0 and 100"
+            if age < 0 or age > 604800:
+                return "Error: max_age must be between 0 and 604800 seconds"
+            invite = await message.channel.create_invite(
+                max_uses=uses, max_age=age
+            )
+            return f"Invite created: {invite.url} (max uses: {uses}, expires in: {age}s)"
+        except discord.Forbidden:
+            return "Error: I don't have permission to create invites here"
+        except ValueError:
+            return "Error: max_uses and max_age must be numbers"
+        except Exception as e:
+            return f"Error creating invite: {e}"
+
+
+class LookupUserTool(Tool):
+    """Look up information about a Discord user"""
+
+    def get_description(self):
+        return "Look up a Discord user by ID. Returns name, creation date, avatar. Params: user_id (required)."
+
+    async def execute(self, message: Message, user_id: str = None, **kwargs) -> str:
+        if not user_id:
+            return "Error: user_id is required"
+        try:
+            user = await self.bot.fetch_user(int(user_id))
+            if not user:
+                return f"Error: User {user_id} not found"
+            created = user.created_at.strftime("%Y-%m-%d") if user.created_at else "unknown"
+            info = (
+                f"Name: {user.display_name} (@{user.name})\n"
+                f"ID: {user.id}\n"
+                f"Created: {created}\n"
+                f"Bot: {user.bot}\n"
+                f"Avatar: {user.avatar_url}"
+            )
+            return info
+        except discord.NotFound:
+            return f"Error: User {user_id} not found"
+        except ValueError:
+            return f"Error: Invalid user_id: {user_id}"
+        except Exception as e:
+            return f"Error looking up user: {e}"
+
+
+class SearchMessagesTool(Tool):
+    """Search for messages in the server"""
+
+    def get_description(self):
+        return "Search messages in this server. Params: query (required), limit (optional, default 5)."
+
+    async def execute(
+        self, message: Message, query: str = None, limit: str = "5", **kwargs
+    ) -> str:
+        if not query:
+            return "Error: query is required"
+        if not message.guild:
+            return "Error: Cannot search in DMs"
+        try:
+            search_limit = max(1, min(int(limit), 25))
+            results = []
+            async for msg in message.guild.search(
+                content=query, limit=search_limit
+            ):
+                snippet = msg.content[:150] + ("..." if len(msg.content) > 150 else "")
+                results.append(
+                    f"[{msg.id}] {msg.author.display_name}: {snippet}"
+                )
+            if not results:
+                return f"No messages found matching '{query}'"
+            return "Search results:\n" + "\n".join(results)
+        except discord.Forbidden:
+            return "Error: I don't have permission to search in this server"
+        except Exception as e:
+            return f"Error searching messages: {e}"
+
+
+class SetNicknameTool(Tool):
+    """Change the bot's own nickname in the server"""
+
+    def get_description(self):
+        return "Change your nickname in this server. Params: nickname (required, 'reset' to remove)."
+
+    async def execute(self, message: Message, nickname: str = None, **kwargs) -> str:
+        if not nickname:
+            return "Error: nickname is required"
+        if not message.guild:
+            return "Error: Cannot set nickname in DMs"
+        try:
+            nick = None if nickname.lower() == "reset" else nickname
+            await message.guild.me.edit(nick=nick)
+            if nick:
+                return f"Nickname changed to '{nickname}'"
+            return "Nickname removed"
+        except discord.Forbidden:
+            return "Error: I don't have permission to change my nickname here"
+        except Exception as e:
+            return f"Error setting nickname: {e}"
+
+
+class ForwardMessageTool(Tool):
+    """Forward a message to another channel"""
+
+    def get_description(self):
+        return "Forward a message to another channel. Params: message_id (required), channel_id (required)."
+
+    async def execute(
+        self, message: Message, message_id: str = None, channel_id: str = None, **kwargs
+    ) -> str:
+        if not message_id or not channel_id:
+            return "Error: message_id and channel_id are required"
+        try:
+            dest = self.bot.get_channel(int(channel_id))
+            if not dest:
+                dest = await self.bot.fetch_channel(int(channel_id))
+            if not dest:
+                return f"Error: Channel {channel_id} not found"
+
+            orig = await message.channel.fetch_message(int(message_id))
+            if not orig:
+                return f"Error: Message {message_id} not found"
+
+            await orig.forward(dest)
+            channel_name = getattr(dest, "name", channel_id)
+            guild_name = getattr(dest.guild, "name", "DM") if hasattr(dest, "guild") else "DM"
+            return f"Forwarded message {message_id} to #{channel_name} in {guild_name}"
+        except discord.NotFound:
+            return "Error: Message or channel not found"
+        except discord.Forbidden:
+            return "Error: I don't have permission to forward messages"
+        except Exception as e:
+            return f"Error forwarding message: {e}"
+
+
+
+class TypingTool(Tool):
+    """Trigger typing indicator in the channel"""
+
+    def get_description(self):
+        return "Trigger typing indicator. No params."
+
+    async def execute(self, message: Message, **kwargs) -> str:
+        try:
+            async with message.channel.typing():
+                pass
+            return "Triggered typing indicator"
+        except Exception as e:
+            return f"Error triggering typing: {e}"
+
+
+class ListServersTool(Tool):
+    """List all servers and group chats the bot is in"""
+
+    def get_description(self):
+        return "List your servers and group chats. No params."
+
+    async def execute(self, message: Message, **kwargs) -> str:
+        lines = []
+        if self.bot.guilds:
+            lines.append(f"Servers ({len(self.bot.guilds)}):")
+            for guild in self.bot.guilds[:20]:
+                lines.append(f"  • {guild.name} (ID: {guild.id})")
+            if len(self.bot.guilds) > 20:
+                lines.append(f"  ... and {len(self.bot.guilds) - 20} more")
+
+        group_channels = [
+            ch for ch in self.bot.private_channels
+            if isinstance(ch, discord.GroupChannel)
+        ]
+        if group_channels:
+            lines.append(f"\nGroup chats ({len(group_channels)}):")
+            for gc in group_channels[:10]:
+                lines.append(f"  • {gc.name or 'Unnamed'} (ID: {gc.id})")
+
+        if not lines:
+            return "You're not in any servers or group chats."
+        return "\n".join(lines)
+
+
+class ChangeAvatarTool(Tool):
+    """Change the bot's own profile picture"""
+
+    def get_description(self):
+        return "Change your profile picture. 30-min cooldown. Params: url (required, direct image URL jpg/png/gif/webp)."
+
+    async def execute(self, message: Message, url: str = None, **kwargs) -> str:
+        if not url:
+            return "Error: url is required"
+
+        if not _is_safe_url(url):
+            return "Error: Cannot fetch from private/internal URLs"
+
+        cooldown = 1800  # 30 minutes
+
+        if self.bot._last_avatar_change:
+            elapsed = datetime.now(timezone.utc).timestamp() - self.bot._last_avatar_change
+            if elapsed < cooldown:
+                remaining = int(cooldown - elapsed)
+                return f"Error: Avatar on cooldown. Wait {remaining} more seconds."
+
+        try:
+            session = await _get_shared_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=False) as resp:
+                if resp.status != 200:
+                    return f"Error: Could not download image (status {resp.status})"
+                content_type = resp.headers.get("Content-Type", "")
+                if content_type and not content_type.startswith("image/"):
+                    return "Error: URL did not return an image"
+                image_bytes = await _read_response_limited(resp, 10 * 1024 * 1024)
+
+            await self.bot.user.edit(avatar=image_bytes)
+            self.bot._last_avatar_change = datetime.now(timezone.utc).timestamp()
+            return "Avatar changed successfully"
+        except discord.HTTPException as e:
+            return f"Error changing avatar: {e}"
+        except Exception as e:
+            return f"Error: {e}"
+
+
+class CreateSiteTool(Tool):
+    """Create a temporary website under the configured public /bot path."""
+
+    MAX_CONTENT_SIZE = 300000
+
+    def __init__(self, bot):
+        super().__init__(bot)
+        self.base_dir = getattr(bot.config, "MAXWELL_SITE_DIR", "public/bot")
+        self.base_url = getattr(bot.config, "MAXWELL_PUBLIC_BASE_URL", "https://maxwell.example.com").rstrip("/") + "/bot"
+
+    def get_description(self):
+        return (
+            f"Create a temporary website at {self.base_url}/<name>. Auto-deletes after 24h. "
+            "Params: name (short slug, lowercase/numbers/hyphens), title (headline), "
+            "body (FULL HTML document — write complete <!DOCTYPE html> pages with all styles/JS inline. "
+            "Written as-is to file, no template wrapping)."
+        )
+
+    async def execute(self, message: Message, name: str = None, title: str = None, body: str = None, **kwargs) -> str:
+        if not name or not title or body is None:
+            missing = []
+            if not name:
+                missing.append("name")
+            if not title:
+                missing.append("title")
+            if body is None:
+                missing.append("body")
+            return f"Error: missing required params — {', '.join(missing)}. All three (name, title, body) are needed to create a site."
+
+        # Sanitize name
+        slug = re.sub(r"[^a-z0-9-]", "-", name.lower().strip())[:30].strip("-")
+        if not slug or len(slug) < 2:
+            return "Error: name must be at least 2 valid characters"
+
+        user_id = str(message.author.id)
+        sites = self.bot._sites
+
+        if len(body) > self.MAX_CONTENT_SIZE:
+            return f"Error: content too long ({len(body)} chars, max {self.MAX_CONTENT_SIZE})"
+
+        site_dir = os.path.join(self.base_dir, slug)
+        try:
+            os.makedirs(site_dir, exist_ok=True)
+            index_path = os.path.join(site_dir, "index.html")
+            async with aiofiles.open(index_path, "w", encoding="utf-8") as f:
+                await f.write(body)
+
+            sites[slug] = {
+                "user_id": user_id,
+                "user_name": message.author.display_name,
+                "created_at": datetime.now(timezone.utc).timestamp(),
+                "title": title,
+                "path": site_dir,
+            }
+            await self._save_sites()
+            return f"Site created: {self.base_url}/{slug}/"
+        except Exception as e:
+            logger.error(f"Failed to create site {slug}: {e}")
+            return f"Error creating site: {e}"
+
+    async def _save_sites(self):
+        try:
+            path = Path(self.bot.config.DATA_DIR) / "sites.json"
+            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(self.bot._sites, indent=2, default=str))
+        except Exception as e:
+            logger.error(f"Failed to save sites: {e}")
+
+
+class ListSitesTool(Tool):
+    """List your active temporary sites"""
+
+    def get_description(self):
+        return "List your active temporary websites. No params."
+
+    async def execute(self, message: Message, **kwargs) -> str:
+        user_id = str(message.author.id)
+        sites = self.bot._sites
+        user_sites = {k: v for k, v in sites.items() if v.get("user_id") == user_id}
+
+        if not user_sites:
+            return "You don't have any active sites."
+
+        lines = []
+        now = datetime.now(timezone.utc).timestamp()
+        for slug, data in user_sites.items():
+            created = data.get("created_at", 0)
+            age = now - created
+            remaining = max(0, 86400 - age)
+            hours = int(remaining // 3600)
+            mins = int((remaining % 3600) // 60)
+            title = data.get("title", "untitled")
+            base_url = getattr(self.bot.config, "MAXWELL_PUBLIC_BASE_URL", "https://maxwell.example.com").rstrip("/")
+            lines.append(f"  • {base_url}/bot/{slug}/ — '{title}' ({hours}h {mins}m left)")
+        return "Your active sites:\n" + "\n".join(lines)
+
+
+class WebSearchTool(Tool):
+    """Search the web using DuckDuckGo"""
+
+    def get_description(self):
+        return (
+            "Search the web. Use proactively for factual/recent info you're not 100% certain about. "
+            "Don't search for casual conversation. Params: query (required), max_results (optional, default 5, max 10)."
+        )
+
+    async def execute(self, message: Message, query: str = None, max_results: str = "5", **kwargs) -> str:
+        if not query:
+            return "Error: query is required"
+
+        try:
+            limit = max(1, min(int(max_results), 10))
+        except (ValueError, TypeError):
+            limit = 5
+
+        try:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, lambda: list(_DDGS().text(query, max_results=limit)))
+
+            if not results:
+                return f"No results found for '{query}'"
+
+            lines = []
+            for i, r in enumerate(results, 1):
+                title = r.get("title", "No title")
+                href = r.get("href", "")
+                body = r.get("body", "")[:200]
+                lines.append(f"{i}. {title}\n   {href}\n   {body}")
+            return "\n\n".join(lines)
+        except Exception as e:
+            logger.error(f"Web search error: {e}")
+            return f"Error searching: {e}"
+
+
+class NoResponseTool(Tool):
+    """Silently skip sending any reply to the current message"""
+
+    def get_description(self):
+        return "Skip replying to this message entirely. Use when you have nothing to say."
+
+    async def execute(self, message: Message, **kwargs) -> str:
+        return "__NO_RESPONSE__"
+
+
+class ShellTool(Tool):
+    """Execute commands in an isolated Docker container (OWNER ONLY)"""
+
+    CONTAINER_NAME = "maxwell-shell"
+    IMAGE_NAME = "maxwell-shell"
+    DOCKERFILE_DIR = os.path.join(os.path.dirname(__file__), "docker")
+    MAX_OUTPUT = 8000
+    TIMEOUT = 60
+
+    def __init__(self, bot):
+        super().__init__(bot)
+        self._container_ready = False
+
+    def get_description(self):
+        return (
+            "Run a shell command in a Docker container (OWNER ONLY). Has curl, python3, git, nmap, dig, jq, etc. "
+            "Container persists between calls. Output sent directly to chat. "
+            "Params: command (required)."
+        )
+
+    async def execute(self, message: Message, command: str = None, **kwargs) -> str:
+        if str(message.author.id) not in OWNER_IDS:
+            return "Error: shell is owner-only"
+        if not command or not command.strip():
+            return "Error: command is required"
+
+        ok = await self._ensure_container()
+        if not ok:
+            return "Error: could not start or connect to shell container"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", self.CONTAINER_NAME,
+                "bash", "-lc", command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
+        except asyncio.TimeoutError:
+            text = f"$ {command}\n\u23f1 Timed out after {self.TIMEOUT}s"
+            await message.reply(f"```ansi\n{text}\n```")
+            return "__SHELL_SENT__"
+        except Exception as e:
+            text = f"$ {command}\n\u274c Error: {e}"
+            await message.reply(f"```ansi\n{text}\n```")
+            return "__SHELL_SENT__"
+
+        out = stdout.decode(errors="replace")
+        err = stderr.decode(errors="replace")
+        exit_code = proc.returncode
+        combined = ""
+        if out.strip():
+            combined += out.strip()
+        if err.strip():
+            if combined:
+                combined += "\n"
+            combined += f"[stderr] {err.strip()}"
+        if exit_code != 0:
+            combined += f"\n[exit code: {exit_code}]"
+
+        if len(combined) > self.MAX_OUTPUT:
+            combined = combined[:self.MAX_OUTPUT] + "\n... (truncated)"
+
+        text = f"$ {command}\n{combined}"
+        chunks = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= 1990:
+                chunks.append(remaining)
+                break
+            header = f"$ {command}\n"
+            cut = remaining.rfind("\n", 0, 1990)
+            if cut <= len(header):
+                cut = 1990
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+
+        for chunk in chunks:
+            await message.reply(f"```ansi\n{chunk}\n```")
+            if len(chunks) > 1:
+                await asyncio.sleep(0.3)
+
+        return "__SHELL_SENT__"
+
+    async def _ensure_container(self):
+        if self._container_ready:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "exec", self.CONTAINER_NAME, "echo", "ready",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                if proc.returncode == 0:
+                    return True
+            except Exception:
+                pass
+            self._container_ready = False
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "inspect", self.CONTAINER_NAME,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode == 0:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "rm", "-f", self.CONTAINER_NAME,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+        except Exception:
+            pass
+
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "build", "-t", self.IMAGE_NAME, self.DOCKERFILE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(f"Docker build failed: {stderr.decode()[-500:]}")
+            return False
+
+        cmd = [
+            "docker", "run", "-d",
+            "--name", self.CONTAINER_NAME,
+            "--network", "none",
+            "--memory", "256m",
+            "--cpus", "0.5",
+            "--pids-limit", "128",
+            "--read-only",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges:true",
+            self.IMAGE_NAME,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(f"Docker run failed: {stderr.decode()[-500:]}")
+            return False
+
+        self._container_ready = True
+        logger.info(f"Shell container '{self.CONTAINER_NAME}' started")
+        return True
+
+
+class FetchUrlTool(Tool):
+    """Fetch and extract text content from a URL"""
+
+    MAX_CONTENT = 15000
+    MAX_BYTES = 1024 * 1024
+
+    def get_description(self):
+        return (
+            "Fetch a URL and return readable text. Handles HTML, JSON, plain text. "
+            "Params: url (required), max_length (optional, default 15000)."
+        )
+
+    async def execute(self, message: Message, url: str = None, max_length: str = "15000", **kwargs) -> str:
+        if not url:
+            return "Error: url is required"
+
+        if not _is_safe_url(url):
+            return "Error: Cannot fetch from private/internal URLs"
+
+        try:
+            max_len = max(1, min(int(max_length), self.MAX_CONTENT))
+        except (ValueError, TypeError):
+            max_len = self.MAX_CONTENT
+
+        try:
+            session = await _get_shared_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=False) as resp:
+                if resp.status != 200:
+                    return f"Error: HTTP {resp.status}"
+                content_type = resp.headers.get("Content-Type", "")
+                raw = await _read_response_limited(resp, self.MAX_BYTES)
+        except asyncio.TimeoutError:
+            return f"Error: timed out fetching {url}"
+        except Exception as e:
+            return f"Error fetching URL: {e}"
+
+        try:
+            if "json" in content_type or url.endswith(".json"):
+                text = raw.decode(errors="replace")
+                import json as _json
+                try:
+                    text = _json.dumps(_json.loads(text), indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+            elif "html" in content_type or "<html" in raw[:500].decode(errors="replace").lower():
+                html_text = raw.decode(errors="replace")
+                text = html_text
+                for tag in ["script", "style", "noscript", "header", "footer", "nav", "aside"]:
+                    text = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", "", text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+                text = re.sub(r"</?(?:p|div|li|h[1-6]|tr|blockquote)[^>]*>", "\n", text, flags=re.IGNORECASE)
+                text = re.sub(r"<[^>]+>", "", text)
+                text = re.sub(r"&nbsp;", " ", text)
+                text = re.sub(r"&amp;", "&", text)
+                text = re.sub(r"&lt;", "<", text)
+                text = re.sub(r"&gt;", ">", text)
+                text = re.sub(r"&quot;", '"', text)
+                text = re.sub(r"&#\d+;", "", text)
+                text = re.sub(r"\n{3,}", "\n\n", text)
+                text = re.sub(r"[ \t]+", " ", text)
+            else:
+                text = raw.decode(errors="replace")
+        except Exception as e:
+            return f"Error parsing content: {e}"
+
+        text = text.strip()
+        if len(text) > max_len:
+            text = text[:max_len] + "\n... (truncated)"
+
+        return text
+
+
+class SendMemeTool(Tool):
+    """Send a random meme from Reddit"""
+
+    MEME_API = "https://meme-api.com/gimme"
+    MAX_SIZE = 25 * 1024 * 1024
+
+    def get_description(self):
+        return (
+            "Send a random meme from Reddit. Params: subreddit (optional, e.g. 'me_irl', 'dankmemes'). "
+            "No params = random from r/memes."
+        )
+
+    async def execute(self, message: Message, subreddit: str = None, **kwargs) -> str:
+        url = self.MEME_API
+        if subreddit:
+            sub = subreddit.strip().removeprefix("r/")
+            if not re.fullmatch(r"[A-Za-z0-9_]{2,21}", sub):
+                return "Error: invalid subreddit name"
+            url = f"{self.MEME_API}/{sub}"
+
+        try:
+            session = await _get_shared_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return f"Error: meme API returned {resp.status}"
+                data = await resp.json()
+        except Exception as e:
+            return f"Error fetching meme: {e}"
+
+        meme_url = data.get("url")
+        title = data.get("title", "meme")
+        sub = data.get("subreddit", "memes")
+        ups = data.get("ups", 0)
+        nsfw = data.get("nsfw", False)
+
+        if nsfw:
+            return "Error: got an NSFW meme, skipping"
+
+        if not meme_url:
+            return "Error: no meme URL in response"
+
+        if not _is_safe_url(meme_url):
+            return "Error: meme API returned an unsafe media URL"
+
+        try:
+            async with session.get(meme_url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=False) as img_resp:
+                if img_resp.status != 200:
+                    return f"Error: could not download meme image ({img_resp.status})"
+                img_bytes = await _read_response_limited(img_resp, self.MAX_SIZE)
+        except Exception as e:
+            return f"Error downloading meme: {e}"
+
+        filename = meme_url.rsplit("/", 1)[-1].split("?")[0] or "meme.png"
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm"):
+            filename += ".png"
+
+        file = File(BytesIO(img_bytes), filename=filename)
+        try:
+            await message.reply(file=file)
+        except discord.Forbidden:
+            return "Error: no permission to send files here"
+        except discord.HTTPException as e:
+            return f"Error sending meme: {e}"
+
+        return f"__MEME_SENT__ Sent meme: \"{title}\" from r/{sub} ({ups} upvotes)"
+
+
+class SendMediaTool(Tool):
+    """Send an image/video from a URL as a Discord attachment"""
+
+    MAX_SIZE = 25 * 1024 * 1024
+
+    def get_description(self):
+        return (
+            "Send an image/video URL as a Discord attachment. "
+            "Params: url (required, direct link to media file)."
+        )
+
+    async def execute(self, message: Message, url: str = None, **kwargs) -> str:
+        if not url:
+            return "Error: url is required"
+
+        if not _is_safe_url(url):
+            return "Error: Cannot fetch from private/internal URLs"
+
+        try:
+            session = await _get_shared_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=False) as resp:
+                if resp.status != 200:
+                    return f"Error: HTTP {resp.status}"
+                media_bytes = await _read_response_limited(resp, self.MAX_SIZE)
+        except asyncio.TimeoutError:
+            return f"Error: timed out downloading {url}"
+        except Exception as e:
+            return f"Error downloading: {e}"
+
+        filename = url.rsplit("/", 1)[-1].split("?")[0] or "media"
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".weba", ".mp3"):
+            filename += ".png"
+
+        file = File(BytesIO(media_bytes), filename=filename)
+        try:
+            await message.reply(file=file)
+        except discord.Forbidden:
+            return "Error: no permission to send files here"
+        except discord.HTTPException as e:
+            return f"Error sending media: {e}"
+
+        return f"__MEDIA_SENT__ Sent media: {filename}"

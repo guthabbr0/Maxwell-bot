@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maxwell // Neural Interface</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#04060b;--bg2:#080c16;--bg3:#0c1122;--card:#0e1530;--card-h:#121a3a;--bdr:#1a2744;--bdr-h:#2a4a7a;--fg:#d4ddf0;--fg2:#8899b8;--fg3:#4a5a78;--cyan:#00e5ff;--cyan2:#00b8d4;--cyan-g:rgba(0,229,255,.15);--magenta:#ff00e5;--mag-g:rgba(255,0,229,.15);--ok:#00ff88;--ok-g:rgba(0,255,136,.12);--warn:#ffaa00;--err:#ff3355;--font:'JetBrains Mono','Space Grotesk',monospace;--sans:'Space Grotesk',system-ui,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:3px}::-webkit-scrollbar-thumb:hover{background:var(--bdr-h)}
+html,body{background:var(--bg);color:var(--fg);font-family:var(--font);line-height:1.5;overflow-x:hidden;min-height:100vh}
+a{color:var(--cyan);text-decoration:none;transition:all .2s}a:hover{color:#fff;text-shadow:0 0 12px var(--cyan)}
+
+#bgCanvas{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:.06}
+.scanline{position:fixed;top:0;left:0;right:0;bottom:0;z-index:9998;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,229,255,.015) 2px,rgba(0,229,255,.015) 4px);mix-blend-mode:screen}
+
+.top{position:sticky;top:0;z-index:100;background:rgba(4,6,11,.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--bdr);padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between}
+.top-left{display:flex;align-items:center;gap:16px}
+.logo{font-size:18px;font-weight:800;letter-spacing:-0.03em;background:linear-gradient(135deg,var(--cyan),var(--magenta));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-family:var(--sans)}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 12px var(--ok);animation:pulse 2s infinite}
+.live-dot.off{background:var(--err);box-shadow:0 0 12px var(--err)}
+@keyframes pulse{0%,100%{opacity:.6;transform:scale(.9)}50%{opacity:1;transform:scale(1.1)}}
+.status-tag{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:4px 10px;border-radius:4px;background:var(--ok-g);color:var(--ok);border:1px solid rgba(0,255,136,.2)}
+.status-tag.off{background:rgba(255,51,85,.12);color:var(--err);border-color:rgba(255,51,85,.2)}
+.nav-r{display:flex;gap:8px;align-items:center}
+.nav-btn{background:transparent;border:1px solid var(--bdr);color:var(--fg2);font:inherit;font-size:11px;font-weight:600;letter-spacing:.04em;padding:6px 14px;border-radius:6px;cursor:pointer;transition:all .15s;text-transform:uppercase}
+.nav-btn:hover{border-color:var(--cyan);color:var(--cyan);background:var(--cyan-g)}
+
+.grid{display:grid;grid-template-columns:260px 1fr;gap:20px;max-width:1600px;margin:0 auto;padding:20px 24px 40px;position:relative;z-index:1}
+
+aside{background:var(--card);border:1px solid var(--bdr);border-radius:12px;overflow:hidden;height:max-content;position:sticky;top:76px}
+.aside-section{padding:16px;border-bottom:1px solid var(--bdr)}
+.aside-section:last-child{border-bottom:0}
+.aside-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--magenta);margin-bottom:12px;display:flex;align-items:center;gap:6px}
+.aside-title::before{content:'';display:inline-block;width:3px;height:12px;background:var(--magenta);border-radius:2px}
+.sr{display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:12px;border-bottom:1px solid rgba(26,39,68,.5)}
+.sr:last-child{border-bottom:0}
+.sr .lbl{color:var(--fg2)}
+.pill{font-size:10px;font-weight:700;text-transform:uppercase;padding:3px 8px;border-radius:4px;letter-spacing:.04em}
+.pill.on{color:var(--ok);background:var(--ok-g);border:1px solid rgba(0,255,136,.25)}
+.pill.off{color:var(--fg3);background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.05)}
+
+.ctrl-toggle{display:flex;align-items:center;justify-content:space-between;padding:6px 0}
+.ctrl-toggle .lbl{color:var(--fg2);font-size:12px}
+.switch{position:relative;width:36px;height:20px;background:var(--bdr);border-radius:10px;cursor:pointer;transition:background .2s}
+.switch.on{background:rgba(0,255,136,.3)}
+.switch::after{content:'';position:absolute;top:3px;left:3px;width:14px;height:14px;background:var(--fg2);border-radius:50%;transition:transform .2s,background .2s}
+.switch.on::after{transform:translateX(16px);background:var(--ok);box-shadow:0 0 8px var(--ok)}
+
+main{display:flex;flex-direction:column;gap:20px}
+
+.hero-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.hero-card{background:var(--card);border:1px solid var(--bdr);border-radius:12px;padding:20px;position:relative;overflow:hidden;transition:all .25s}
+.hero-card:hover{border-color:var(--bdr-h);transform:translateY(-2px);box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.hero-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:12px 12px 0 0}
+.hero-card.cyan::before{background:linear-gradient(90deg,var(--cyan),transparent)}
+.hero-card.mag::before{background:linear-gradient(90deg,var(--magenta),transparent)}
+.hero-card.ok::before{background:linear-gradient(90deg,var(--ok),transparent)}
+.hero-num{font-size:36px;font-weight:800;line-height:1;font-family:var(--sans)}
+.hero-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg2);margin-top:4px;font-weight:600}
+.hero-sub{font-size:11px;color:var(--fg3);margin-top:8px}
+
+.stats-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+.stat{background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:14px;position:relative;overflow:hidden;transition:all .2s}
+.stat:hover{border-color:var(--bdr-h)}
+.stat-num{font-size:22px;font-weight:800;color:#fff;font-family:var(--sans)}
+.stat-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg2);margin-top:4px;font-weight:600}
+.stat-bar{height:3px;background:rgba(255,255,255,.04);border-radius:2px;margin-top:8px;overflow:hidden}
+.stat-bar-fill{height:100%;border-radius:2px;transition:width 1.2s cubic-bezier(.4,0,.2,1);width:0}
+
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{background:var(--card);border:1px solid var(--bdr);border-radius:12px;overflow:hidden;transition:border-color .2s}
+.panel:hover{border-color:var(--bdr-h)}
+.panel-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--bdr);background:var(--bg2)}
+.panel-head h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;color:var(--cyan)}
+.panel-total{font-size:10px;color:var(--fg3);font-weight:600}
+.panel-body{max-height:340px;overflow-y:auto;padding:4px 0}
+.li{display:flex;align-items:flex-start;gap:10px;padding:10px 16px;border-bottom:1px solid rgba(26,39,68,.4);transition:background .1s;cursor:default}
+.li:last-child{border-bottom:0}
+.li:hover{background:rgba(0,229,255,.02)}
+.li-id{font-size:10px;color:var(--magenta);font-weight:700;min-width:40px;padding-top:2px}
+.li-content{flex:1;font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li-sub{font-size:10px;color:var(--fg3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.li-link{color:var(--cyan);font-weight:600}.li-link:hover{text-decoration:underline;color:#fff}
+.empty{padding:30px 16px;color:var(--fg3);font-size:12px;text-align:center}
+
+.uptime-bar{background:var(--card);border:1px solid var(--bdr);border-radius:12px;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;position:relative;overflow:hidden}
+.uptime-bar::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,229,255,.03),transparent);pointer-events:none}
+.uptime-label{font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;color:var(--fg2)}
+.uptime-val{font-size:18px;font-weight:800;color:#fff;font-family:var(--sans)}
+
+.sys-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.sys-card{background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:14px}
+.sys-card .sys-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg3);font-weight:700}
+.sys-card .sys-val{font-size:16px;font-weight:700;color:#fff;margin-top:4px;font-family:var(--sans)}
+.sys-bar{height:4px;background:rgba(255,255,255,.05);border-radius:2px;margin-top:6px;overflow:hidden}
+.sys-bar-fill{height:100%;border-radius:2px;transition:width .8s ease-out}
+
+footer{text-align:center;color:var(--fg3);font-size:11px;padding:40px 0 20px;position:relative;z-index:1}
+
+@media(max-width:1100px){.grid{grid-template-columns:1fr}aside{position:static}.stats-grid{grid-template-columns:repeat(3,1fr)}.hero-row{grid-template-columns:1fr 1fr}}
+@media(max-width:768px){.stats-grid{grid-template-columns:repeat(2,1fr)}.panels{grid-template-columns:1fr}.hero-row{grid-template-columns:1fr}.sys-grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<div class="scanline" id="scanline"></div>
+
+<header class="top">
+<div class="top-left">
+<span class="logo">MAXWELL</span>
+<div class="live-dot" id="liveDot"></div>
+<span class="status-tag" id="statusTag">LOADING</span>
+</div>
+<div class="nav-r">
+<button class="nav-btn" onclick="toggleBg()">BG</button>
+<a href="/admin/" class="nav-btn" style="border-color:var(--magenta);color:var(--magenta)">ADMIN</a>
+</div>
+</header>
+
+<div class="grid">
+<aside>
+<div class="aside-section">
+<div class="aside-title">Runtime Controls</div>
+<div id="controlsList"></div>
+</div>
+<div class="aside-section">
+<div class="aside-title">Infrastructure</div>
+<div class="sr"><span class="lbl">Bot Process</span><span class="pill" id="pm2Bot">...</span></div>
+<div class="sr"><span class="lbl">Restarts</span><span style="color:var(--warn);font-weight:700" id="pm2BotR">0</span></div>
+<div class="sr"><span class="lbl">API Process</span><span class="pill" id="pm2Api">...</span></div>
+</div>
+<div class="aside-section">
+<div class="aside-title">System</div>
+<div class="sr"><span class="lbl">Load</span><span style="color:var(--fg);font-weight:600" id="sysLoad">-</span></div>
+<div class="sr"><span class="lbl">RAM</span><span style="color:var(--fg);font-weight:600" id="sysMem">-</span></div>
+<div class="sr"><span class="lbl">Disk</span><span style="color:var(--fg);font-weight:600" id="sysDisk">-</span></div>
+<div class="sr"><span class="lbl">Uptime</span><span style="color:var(--fg);font-weight:600" id="sysUptime">-</span></div>
+</div>
+</aside>
+
+<main>
+<div class="uptime-bar">
+<span class="uptime-label">Bot Uptime</span>
+<span class="uptime-val" id="uptimeVal">00h 00m 00s</span>
+</div>
+
+<div class="hero-row">
+<div class="hero-card cyan">
+<div class="hero-num" id="hChannels">0</div>
+<div class="hero-label">Channels</div>
+<div class="hero-sub" id="hMessages">0 messages tracked</div>
+</div>
+<div class="hero-card mag">
+<div class="hero-num" id="hMemories">0</div>
+<div class="hero-label">Memories</div>
+<div class="hero-sub" id="hAuto">0 auto channels</div>
+</div>
+<div class="hero-card ok">
+<div class="hero-num" id="hSites">0</div>
+<div class="hero-label">Live Sites</div>
+<div class="hero-sub" id="hBlocked">0 blocked users</div>
+</div>
+</div>
+
+<div class="stats-grid">
+<div class="stat"><div class="stat-num" id="sLTM">0</div><div class="stat-lbl">LTM Lines</div><div class="stat-bar"><div class="stat-bar-fill" id="bLTM" style="background:var(--cyan)"></div></div></div>
+<div class="stat"><div class="stat-num" id="sPrompts">0</div><div class="stat-lbl">Prompts</div><div class="stat-bar"><div class="stat-bar-fill" id="bPrompts" style="background:var(--magenta)"></div></div></div>
+<div class="stat"><div class="stat-num" id="sAuto">0</div><div class="stat-lbl">Auto Chans</div><div class="stat-bar"><div class="stat-bar-fill" id="bAuto" style="background:var(--ok)"></div></div></div>
+<div class="stat"><div class="stat-num" id="sBlack">0</div><div class="stat-lbl">Blocked</div><div class="stat-bar"><div class="stat-bar-fill" id="bBlack" style="background:var(--err)"></div></div></div>
+<div class="stat"><div class="stat-num" id="sTools">0</div><div class="stat-lbl">Tools</div><div class="stat-bar"><div class="stat-bar-fill" id="bTools" style="background:var(--warn)"></div></div></div>
+<div class="stat"><div class="stat-num" id="sCmds">0</div><div class="stat-lbl">Commands</div><div class="stat-bar"><div class="stat-bar-fill" id="bCmds" style="background:#8855ff"></div></div></div>
+</div>
+
+<div class="sys-grid" id="sysGrid">
+<div class="sys-card"><div class="sys-lbl">CPU Load (1m)</div><div class="sys-val" id="sysCpu">-</div><div class="sys-bar"><div class="sys-bar-fill" id="sysCpuBar" style="background:var(--cyan)"></div></div></div>
+<div class="sys-card"><div class="sys-lbl">Memory Used</div><div class="sys-val" id="sysRamDetail">-</div><div class="sys-bar"><div class="sys-bar-fill" id="sysRamBar" style="background:var(--magenta)"></div></div></div>
+<div class="sys-card"><div class="sys-lbl">Disk Used</div><div class="sys-val" id="sysDiskDetail">-</div><div class="sys-bar"><div class="sys-bar-fill" id="sysDiskBar" style="background:var(--ok)"></div></div></div>
+</div>
+
+<div class="panels">
+<div class="panel"><div class="panel-head"><h2>Recent Memories</h2><span class="panel-total" id="cMemories">0 total</span></div><div class="panel-body" id="memoriesBody"><div class="empty">Loading...</div></div></div>
+<div class="panel"><div class="panel-head"><h2>Active Sites</h2><span class="panel-total" id="cSites">0 live</span></div><div class="panel-body" id="sitesBody"><div class="empty">Loading...</div></div></div>
+<div class="panel"><div class="panel-head"><h2>Custom Prompts</h2><span class="panel-total" id="cPrompts">0 custom</span></div><div class="panel-body" id="promptsBody"><div class="empty">Loading...</div></div></div>
+<div class="panel"><div class="panel-head"><h2>Blocked Users</h2><span class="panel-total" id="cBlack">0 total</span></div><div class="panel-body" id="blackBody"><div class="empty">Loading...</div></div></div>
+<div class="panel" style="grid-column:span 2"><div class="panel-head"><h2>Live Activity Feed</h2><span class="panel-total" id="cCommands">0 actions</span></div><div class="panel-body" id="commandsBody"><div class="empty">Loading...</div></div></div>
+</div>
+</main>
+</div>
+
+<footer>Maxwell Neural Interface</footer>
+
+<script>
+let startTs=null;
+function $(id){return document.getElementById(id)}
+function tx(id,t){const e=$(id);if(e)e.textContent=t}
+function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
+function pill(cls,v){return '<span class="pill '+cls+'">'+esc(v)+'</span>'}
+
+const CONTROL_KEYS=[
+  ['bot_enabled','Bot'],['reply_dms','DMs'],['reply_groups','Groups'],
+  ['reply_mentions','Mentions'],['auto_mode_enabled','Auto'],['tools_enabled','Tools'],['store_memory','Memory']
+];
+
+let bgEnabled=true;
+let ctx,cols,yPos,w,h;
+
+function initBg(){
+  const c=$('bgCanvas');
+  ctx=c.getContext('2d');
+  resize();
+  window.addEventListener('resize',resize);
+  drawBg();
+}
+function resize(){w=$('bgCanvas').width=window.innerWidth;h=$('bgCanvas').height=window.innerHeight;cols=Math.floor(w/18)+1;yPos=Array(cols).fill(0)}
+function drawBg(){
+  if(!bgEnabled)return;
+  ctx.fillStyle='rgba(4,6,11,0.12)';
+  ctx.fillRect(0,0,w,h);
+  const chars='アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789';
+  ctx.font='12pt monospace';
+  ctx.fillStyle='rgba(0,229,255,0.7)';
+  yPos.forEach((y,i)=>{
+    const ch=chars[Math.floor(Math.random()*chars.length)];
+    ctx.fillText(ch,i*18,y);
+    if(y>100+Math.random()*8000)yPos[i]=0;
+    else yPos[i]=y+18;
+  });
+  requestAnimationFrame(drawBg);
+}
+function toggleBg(){
+  bgEnabled=!bgEnabled;
+  if(!bgEnabled){ctx.clearRect(0,0,w,h);$('bgCanvas').style.opacity='0'}
+  else{$('bgCanvas').style.opacity='0.06';drawBg()}
+}
+
+function renderControls(control){
+  let html='';
+  CONTROL_KEYS.forEach(([key,label])=>{
+    const v=control[key];
+    const cls=v?'on':'off';
+    html+='<div class="ctrl-toggle"><span class="lbl">'+label+'</span><div class="switch '+cls+'" data-key="'+key+'"></div></div>';
+  });
+  $('controlsList').innerHTML=html;
+  $('controlsList').querySelectorAll('.switch').forEach(el=>{
+    el.addEventListener('click',async()=>{
+      const key=el.dataset.key;
+      const newVal=el.classList.contains('on')?false:true;
+      try{
+        const control={};
+        control[key]=newVal;
+        const creds=JSON.parse(localStorage.getItem('maxwellAuth')||'{}');
+        const headers={'Content-Type':'application/json'};
+        if(creds.u&&creds.p)headers.Authorization='Basic '+btoa(creds.u+':'+creds.p);
+        const r=await fetch('/api/control',{method:'PUT',headers,body:JSON.stringify(control)});
+        if(r.ok){el.classList.toggle('on');el.classList.toggle('off')}
+      }catch(e){}
+    });
+  });
+}
+
+function fmtAge(ts){
+  if(!ts)return'?';
+  const h=Math.round((Date.now()/1000-ts)/3600);
+  if(h<1)return Math.round((Date.now()/1000-ts)/60)+'m ago';
+  if(h<24)return h+'h ago';
+  return Math.round(h/24)+'d ago';
+}
+function fmtRemain(ts){
+  if(!ts)return'?';
+  const left=Math.max(0,86400-(Date.now()/1000-ts));
+  return Math.floor(left/3600)+'h '+Math.floor((left%3600)/60)+'m left';
+}
+function fmtBytes(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'K';if(b<1073741824)return(b/1048576).toFixed(1)+'M';return(b/1073741824).toFixed(1)+'G'}
+
+async function loadData(){
+  try{
+    const[memories,sites,prompts,channelMemory,autoChannels,blacklist,controlData,statusData,commands]=await Promise.all([
+      fetch('/data/long_term_memory.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
+      fetch('/data/sites.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      fetch('/data/prompts.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      fetch('/data/memory.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      fetch('/data/auto_channels.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
+      fetch('/data/blacklist.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
+      fetch('/data/bot_control.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      fetch('/api/status').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/api/commands').then(r=>r.ok?r.json():[]).catch(()=>[])
+    ]);
+
+    const memArr=Array.isArray(memories)?memories:[];
+    const sitesObj=sites&&typeof sites==='object'&&!Array.isArray(sites)?sites:{};
+    const promptObj=prompts&&typeof prompts==='object'&&!Array.isArray(prompts)?prompts:{};
+    const chObj=channelMemory&&typeof channelMemory==='object'&&!Array.isArray(channelMemory)?channelMemory:{};
+    const auto=Array.isArray(autoChannels)?autoChannels:[];
+    const bl=Array.isArray(blacklist)?blacklist:[];
+    const ctrl=controlData&&controlData.control?controlData.control:{};
+    const tools=controlData&&Array.isArray(controlData.tools)?controlData.tools:[];
+    const cmds=Array.isArray(commands)?commands:[];
+    const enabled=tools.filter(t=>!(ctrl.disabled_tools||[]).includes(t));
+
+    if(statusData&&statusData.pm2&&statusData.pm2.bot&&statusData.pm2.bot.uptime)startTs=statusData.pm2.bot.uptime;
+
+    const isOnline=statusData?!!statusData.online:false;
+    const tag=$('statusTag');tag.textContent=isOnline?'ONLINE':'OFFLINE';tag.className='status-tag'+(isOnline?'':' off');
+    const dot=$('liveDot');dot.className='live-dot'+(isOnline?'':' off');
+
+    renderControls(ctrl);
+
+    if(statusData&&statusData.pm2){
+      const b=statusData.pm2.bot,a=statusData.pm2.api;
+      if(b){tx('pm2Bot',b.status||'unknown');tx('pm2BotR',b.restart_time??'0')}
+      if(a)tx('pm2Api',a.status||'unknown');
+    }
+
+    const totalMsgs=Object.values(chObj).reduce((s,v)=>s+(Array.isArray(v)?v.length:0),0);
+    tx('hChannels',Object.keys(chObj).length);
+    tx('hMessages',totalMsgs+' messages tracked');
+    tx('hMemories',memArr.length);
+    tx('hAuto',auto.length+' auto channels');
+    tx('hSites',Object.keys(sitesObj).length);
+    tx('hBlocked',bl.length+' blocked users');
+
+    tx('sLTM',memArr.length);
+    tx('sPrompts',Object.keys(promptObj).length);
+    tx('sAuto',auto.length);
+    tx('sBlack',bl.length);
+    tx('sTools',enabled.length+'/'+tools.length);
+    tx('sCmds',cmds.length);
+
+    $('bLTM').style.width=Math.min(100,(memArr.length/500)*100)+'%';
+    $('bPrompts').style.width=Math.min(100,(Object.keys(promptObj).length/10)*100)+'%';
+    $('bAuto').style.width=Math.min(100,(auto.length/10)*100)+'%';
+    $('bBlack').style.width=Math.min(100,(bl.length/30)*100)+'%';
+    $('bTools').style.width=Math.min(100,(enabled.length/Math.max(1,tools.length))*100)+'%';
+    $('bCmds').style.width=Math.min(100,(cmds.length/100)*100)+'%';
+
+    // Memory
+    const mdb=$('memoriesBody');
+    if(!memArr.length)mdb.innerHTML='<div class="empty">No long-term memories.</div>';
+    else{mdb.innerHTML=memArr.slice(-10).reverse().map(m=>'<div class="li"><span class="li-id">#'+esc(m.id??'?')+'</span><span class="li-content">'+esc(m.content??'')+'</span></div>').join('');tx('cMemories',memArr.length+' total')}
+
+    // Sites
+    const sdb=$('sitesBody');
+    if(!Object.keys(sitesObj).length)sdb.innerHTML='<div class="empty">No active sites.</div>';
+    else{sdb.innerHTML=Object.entries(sitesObj).map(([k,v])=>'<div class="li"><span class="li-content"><a class="li-link" href="/bot/'+encodeURIComponent(k)+'/"><b>'+esc(v.title||k)+'</b></a><div class="li-sub">by '+esc(v.user_name||'?')+' &mdash; '+fmtAge(v.created_at)+' / '+fmtRemain(v.created_at)+'</div></span></div>').join('');tx('cSites',Object.keys(sitesObj).length+' live')}
+
+    // Prompts
+    const pdb=$('promptsBody');
+    const pe=Object.entries(promptObj);
+    if(!pe.length)pdb.innerHTML='<div class="empty">No custom prompts.</div>';
+    else{pdb.innerHTML=pe.slice(0,8).map(([id,t])=>'<div class="li"><span class="li-id">'+esc(id)+'</span><span class="li-content">'+esc(String(t).substring(0,200))+'</span></div>').join('');tx('cPrompts',pe.length+' custom')}
+
+    // Blacklist
+    const bdb=$('blackBody');
+    if(!bl.length)bdb.innerHTML='<div class="empty">No blocked users.</div>';
+    else{bdb.innerHTML=bl.map(uid=>'<div class="li"><span class="li-id">'+esc(uid)+'</span><span class="li-content">Blocked user</span></div>').join('');tx('cBlack',bl.length+' total')}
+
+    // Commands
+    const cdb=$('commandsBody');
+    if(!cmds.length)cdb.innerHTML='<div class="empty">No actions logged.</div>';
+    else{cdb.innerHTML=cmds.slice(-10).reverse().map(c=>{let s=esc(c.type||'');if(c.channel_id)s+=' &rarr; #'+esc(c.channel_id);if(c.user_id)s+=' &rarr; @'+esc(c.user_id);if(c.command)s+=' <code>'+esc(c.command)+'</code>';return'<div class="li"><span class="li-id">['+esc(c.id||'')+']</span><span class="li-content"><b>'+s+'</b><div class="li-sub">'+esc(c.status||'')+(c.result?' &mdash; '+esc(String(c.result).substring(0,80)):'')+'</div></span></div>'}).join('');tx('cCmds',cmds.length+' actions')}
+
+  }catch(e){console.error(e)}
+}
+
+async function loadSystem(){
+  try{
+    const r=await fetch('/api/system');
+    if(!r.ok)return;
+    const d=await r.json();
+    if(d.load){
+      tx('sysLoad',d.load[0]+'</span>');
+      tx('sysCpu',d.load[0]);
+      const loadPct=Math.min(100,parseFloat(d.load[0])*100/4);
+      $('sysCpuBar').style.width=loadPct+'%';
+    }
+    if(d.memory){
+      tx('sysMem',d.memory.used_mb+'/'+d.memory.total_mb+' MB');
+      const pct=d.memory.total_mb>0?Math.round(d.memory.used_mb/d.memory.total_mb*100):0;
+      tx('sysRamDetail',pct+'% ('+d.memory.used_mb+'/'+d.memory.total_mb+' MB)');
+      $('sysRamBar').style.width=pct+'%';
+    }
+    if(d.disk){
+      const pct=d.disk.total_bytes>0?Math.round(d.disk.used_bytes/d.disk.total_bytes*100):0;
+      tx('sysDisk',fmtBytes(d.disk.used_bytes)+'/'+fmtBytes(d.disk.total_bytes));
+      tx('sysDiskDetail',pct+'% ('+fmtBytes(d.disk.used_bytes)+'/'+fmtBytes(d.disk.total_bytes)+')');
+      $('sysDiskBar').style.width=pct+'%';
+    }
+    if(d.uptime_seconds){
+      const d=Math.floor(d.uptime_seconds/86400);
+      const h=Math.floor((d.uptime_seconds%86400)/3600);
+      tx('sysUptime',(d>0?d+'d ':'')+h+'h');
+    }
+  }catch(e){}
+}
+
+setInterval(()=>{
+  if(startTs){
+    const diff=Date.now()-startTs;
+    if(diff<0){tx('uptimeVal','offline');return}
+    const s=Math.floor(diff/1000);
+    const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),ss=s%60;
+    let t='';if(d>0)t+=d+'d ';t+=String(h).padStart(2,'0')+'h '+String(m).padStart(2,'0')+'m '+String(ss).padStart(2,'0')+'s';
+    tx('uptimeVal',t);
+  }else tx('uptimeVal','offline');
+},1000);
+
+initBg();
+loadData();
+loadSystem();
+setInterval(loadData,15000);
+setInterval(loadSystem,30000);
+</script>
+</body>
+</html>
