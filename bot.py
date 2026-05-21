@@ -55,6 +55,74 @@ logger = logging.getLogger(__name__)
 
 MAX_VISUAL_MEMORY_IMAGES = 3
 MEDIA_CONTEXT_USES = 11
+TEXT_MIME_TYPES = {
+    "application/json",
+    "application/javascript",
+    "application/typescript",
+    "application/xml",
+    "application/x-httpd-php",
+    "application/x-sh",
+    "application/x-shellscript",
+    "application/x-yaml",
+    "application/yaml",
+    "application/toml",
+    "application/sql",
+    "application/rtf",
+}
+TEXT_ATTACHMENT_EXTS = {
+    ".1", ".2", ".3", ".4", ".5", ".6", ".7", ".8", ".9",
+    ".asm", ".bat", ".c", ".cfg", ".clj", ".cmake", ".cmd", ".conf",
+    ".cpp", ".cs", ".css", ".csv", ".cxx", ".diff", ".dockerfile", ".env",
+    ".erl", ".ex", ".exs", ".fish", ".go", ".h", ".hpp", ".hrl", ".hs",
+    ".htm", ".html", ".inc", ".ini", ".java", ".js", ".json", ".jsx", ".kt",
+    ".kts", ".less", ".lisp", ".log", ".lua", ".m", ".make", ".markdown",
+    ".md", ".ml", ".mli", ".nasm", ".patch", ".php", ".pl", ".pm", ".ps1",
+    ".py", ".r", ".rb", ".rs", ".sass", ".scala", ".scss", ".sh", ".s",
+    ".sql", ".svelte", ".swift", ".toml", ".ts", ".tsx", ".txt", ".vim",
+    ".vue", ".xml", ".yaml", ".yml", ".zig",
+}
+
+
+def _looks_like_text(blob: bytes) -> bool:
+    if not blob:
+        return True
+    sample = blob[:4096]
+    if b"\x00" in sample:
+        return False
+    control = sum(1 for b in sample if b < 32 and b not in (9, 10, 12, 13))
+    return control / max(1, len(sample)) < 0.05
+
+
+def _decoded_looks_readable(text: str) -> bool:
+    if not text:
+        return True
+    sample = text[:4096]
+    control = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\t\n\r\f")
+    replacement = sample.count("\ufffd")
+    return (control + replacement) / max(1, len(sample)) < 0.05
+
+
+def _decode_readable_text(blob: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-16", "latin-1"):
+        try:
+            text = blob.decode(encoding)
+            if _decoded_looks_readable(text):
+                return text
+        except UnicodeError:
+            continue
+    return ""
+
+
+def _is_text_attachment(filename: str, content_type: str, blob: bytes | None = None) -> bool:
+    mime = content_type.split(";", 1)[0].strip().lower()
+    ext = Path(filename).suffix.lower()
+    if mime.startswith("text/") or mime in TEXT_MIME_TYPES:
+        return True
+    if ext in TEXT_ATTACHMENT_EXTS:
+        return True
+    if blob is not None:
+        return _looks_like_text(blob)
+    return False
 
 DEFAULT_CONTROL = {
     "bot_enabled": True,
@@ -310,13 +378,9 @@ class MaxwellBot(commands.Bot):
                 await self.memory.add_to_channel_memory(channel_id, {"author": self.bot_name, "content": message.content, "message_id": message.id})
             return
 
-        media_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".avi", ".mov", ".mkv", ".webm", ".mp3", ".wav", ".ogg", ".m4a", ".flac")
         has_content = bool(message.content)
-        has_media = any(
-            a.filename.lower().endswith(media_exts) or (getattr(a, "content_type", None) or "").startswith(("image/", "video/", "audio/"))
-            for a in message.attachments
-        )
-        if not has_content and not has_media:
+        has_attachment = bool(message.attachments)
+        if not has_content and not has_attachment:
             return
 
         async with self._get_channel_lock(channel_id):
@@ -812,16 +876,25 @@ class MaxwellBot(commands.Bot):
             content_type = getattr(attachment, "content_type", None) or ""
             ext = "." + attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else ""
             is_media = ext in media_exts or content_type.startswith(("image/", "video/", "audio/"))
-            if not is_media:
-                continue
-            if attachment.size > max_size:
-                logger.warning(f"Skipping media {attachment.filename}: too large ({attachment.size} bytes)")
+            is_known_text = _is_text_attachment(attachment.filename, content_type)
+            if attachment.size > max_size and not is_known_text:
+                logger.warning(f"Skipping attachment {attachment.filename}: too large ({attachment.size} bytes)")
                 continue
             try:
                 blob = await attachment.read()
-                b64 = base64.b64encode(blob).decode("utf-8")
-                mime = content_type.split(";")[0] if content_type.startswith(("image/", "video/", "audio/")) else MIME_MAP.get(ext, "application/octet-stream")
+                is_text = is_known_text or (not is_media and _is_text_attachment(attachment.filename, content_type, blob))
+                if not is_media and not is_text:
+                    continue
+                mime = content_type.split(";")[0] if content_type else MIME_MAP.get(ext, "text/plain" if is_text else "application/octet-stream")
                 is_image = ext in image_exts or mime.startswith("image/")
+                text = ""
+                b64 = ""
+                if is_text and not is_image:
+                    text = _decode_readable_text(blob)
+                    if not text and not is_media:
+                        continue
+                else:
+                    b64 = base64.b64encode(blob).decode("utf-8")
                 if is_image:
                     images.append(b64)
                 media.append({
@@ -829,11 +902,14 @@ class MaxwellBot(commands.Bot):
                     "mime_type": mime,
                     "filename": attachment.filename,
                     "is_image": is_image,
+                    "is_text": bool(text),
+                    "text": text,
                     "message_id": getattr(message, "id", None),
                 })
-                logger.info(f"Extracted media {attachment.filename} ({len(blob)} bytes, mime={mime})")
+                kind = "text" if text else "media"
+                logger.info(f"Extracted {kind} attachment {attachment.filename} ({len(blob)} bytes, mime={mime})")
             except Exception as e:
-                logger.error(f"Failed to download media {attachment.filename}: {e}")
+                logger.error(f"Failed to download attachment {attachment.filename}: {e}")
         return images, media
 
     def _cache_media_context(self, channel_id: str, media: list[dict]):
@@ -884,8 +960,18 @@ class MaxwellBot(commands.Bot):
             if len(current_images) > MAX_VISUAL_MEMORY_IMAGES:
                 parts.append(f"Only the latest {MAX_VISUAL_MEMORY_IMAGES} images from this message were kept in visual memory.")
         if current_other:
-            names = ", ".join(f"{item.get('filename', 'media')} ({item.get('mime_type', 'media')})" for item in current_other[:5])
-            parts.append(f"Non-image media attached but not in visual memory: {names}")
+            text_items = [item for item in current_other if item.get("is_text") and item.get("text")]
+            binary_items = [item for item in current_other if item not in text_items]
+            for item in text_items:
+                filename = item.get("filename", "attachment")
+                mime = item.get("mime_type", "text/plain")
+                parts.append(
+                    f"Readable attachment: {filename} ({mime}). Full file contents follow:\n"
+                    f"```text\n{item.get('text', '')}\n```"
+                )
+            if binary_items:
+                names = ", ".join(f"{item.get('filename', 'media')} ({item.get('mime_type', 'media')})" for item in binary_items[:5])
+                parts.append(f"Non-image media attached but not in visual memory: {names}")
         return "\n".join(parts)
 
     def _tick_media_context(self, channel_id: str):
