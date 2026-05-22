@@ -1005,6 +1005,11 @@ class MaxwellBot(commands.Bot):
                     normalized = await self._normalize_video(blob, attachment.filename, max_size)
                     if normalized:
                         blob, mime, filename = normalized
+                    derived = await self._extract_video_derivatives(blob, filename, getattr(message, "id", None), max_size)
+                    for derived_item in derived:
+                        if derived_item.get("is_image"):
+                            images.append(derived_item["b64"])
+                        media.append(derived_item)
                 is_image = ext in image_exts or mime.startswith("image/")
                 text = ""
                 b64 = ""
@@ -1067,6 +1072,82 @@ class MaxwellBot(commands.Bot):
         except Exception as e:
             logger.warning(f"Failed to normalize video {filename}: {e}")
             return None
+
+    async def _extract_video_derivatives(self, blob: bytes, filename: str, message_id, max_size: int) -> list[dict]:
+        """Extract representative frames and audio track from video for reliable model coverage."""
+        results = []
+        suffix = Path(filename).suffix.lower() or ".mp4"
+        try:
+            with tempfile.TemporaryDirectory(prefix="maxwell-vderiv-") as tmp:
+                tmp_path = Path(tmp)
+                video_path = tmp_path / f"input{suffix}"
+                video_path.write_bytes(blob)
+
+                # Extract frames at 2fps (1 every 0.5s), up to 120 frames
+                frame_pattern = str(tmp_path / "frame-%03d.jpg")
+                frame_cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(video_path),
+                    "-vf", "fps=2,scale='min(768,iw)':-2",
+                    "-frames:v", "120",
+                    frame_pattern,
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *frame_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    for frame_path in sorted(tmp_path.glob("frame-*.jpg")):
+                        frame_blob = frame_path.read_bytes()
+                        if len(frame_blob) > max_size:
+                            continue
+                        results.append({
+                            "b64": base64.b64encode(frame_blob).decode("utf-8"),
+                            "mime_type": "image/jpeg",
+                            "filename": f"{filename}-{frame_path.stem}.jpg",
+                            "is_image": True,
+                            "is_text": False,
+                            "text": "",
+                            "message_id": message_id,
+                            "source": "video_frame",
+                        })
+                else:
+                    logger.warning(f"Video frame extraction failed for {filename}: {stderr.decode(errors='replace')[-300:]}")
+
+                # Extract audio track
+                audio_path = tmp_path / "audio.wav"
+                audio_cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(video_path),
+                    "-vn", "-ac", "1", "-ar", "16000",
+                    str(audio_path),
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *audio_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _stdout, stderr = await proc.communicate()
+                if proc.returncode == 0 and audio_path.exists() and audio_path.stat().st_size > 44:
+                    audio_blob = audio_path.read_bytes()
+                    if len(audio_blob) <= max_size:
+                        results.append({
+                            "b64": base64.b64encode(audio_blob).decode("utf-8"),
+                            "mime_type": "audio/wav",
+                            "filename": f"{filename}-audio.wav",
+                            "is_image": False,
+                            "is_text": False,
+                            "text": "",
+                            "message_id": message_id,
+                            "source": "video_audio",
+                        })
+                elif proc.returncode != 0:
+                    logger.info(f"No extractable audio track for {filename}: {stderr.decode(errors='replace')[-200:]}")
+        except Exception as e:
+            logger.warning(f"Failed to derive frames/audio from video {filename}: {e}")
+        if results:
+            frame_count = sum(1 for item in results if item.get("is_image"))
+            audio_count = sum(1 for item in results if item.get("mime_type") == "audio/wav")
+            logger.info(f"Derived {frame_count} frame(s) and {audio_count} audio track(s) from video {filename}")
+        return results
 
     async def _normalize_gif(self, blob: bytes, filename: str, max_size: int) -> tuple[bytes, str, str] | None:
         try:
