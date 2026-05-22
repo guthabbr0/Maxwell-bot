@@ -86,19 +86,21 @@ class OllamaProvider:
             for img_b64 in images:
                 all_media.append({"b64": img_b64, "mime_type": "image/png"})
 
-        vision_media = []
+        payload_media = []
         for m in all_media:
             mime = str(m.get("mime_type", ""))
-            if mime.startswith("image/") and m.get("b64"):
-                vision_media.append(m)
+            if m.get("b64") and mime.startswith(("image/", "audio/", "video/")):
+                payload_media.append(m)
 
-        if vision_media:
+        if payload_media:
             target = None
             for msg in chat_messages:
                 content = msg.get("content", "")
                 if msg["role"] == "user" and (
                     "[User attached image" in content
                     or "[User attached media" in content
+                    or "Media available to inspect" in content
+                    or "Audio/video available to inspect" in content
                     or "Images available to inspect" in content
                 ):
                     target = msg
@@ -110,15 +112,24 @@ class OllamaProvider:
                         break
             if target is not None:
                 parts = [{"type": "text", "text": target.get("content", "")}]
-                for m in vision_media:
+                attached = 0
+                for m in payload_media:
                     mime = m["mime_type"]
                     b64 = m["b64"]
                     uri = f"data:{mime};base64,{b64}"
-                    parts.append({"type": "image_url", "image_url": {"url": uri}})
+                    if mime.startswith("image/"):
+                        parts.append({"type": "image_url", "image_url": {"url": uri}})
+                    elif mime.startswith("audio/"):
+                        parts.append({"type": "audio_url", "audio_url": {"url": uri}})
+                    elif mime.startswith("video/"):
+                        parts.append({"type": "video_url", "video_url": {"url": uri}})
+                    else:
+                        continue
+                    attached += 1
                 target["content"] = parts
-                logger.info(f"Attached {len(vision_media)} image item(s) to message")
+                logger.info(f"Attached {attached} multimodal item(s) to message")
             else:
-                logger.warning(f"No user message found to attach {len(vision_media)} image item(s)")
+                logger.warning(f"No user message found to attach {len(payload_media)} multimodal item(s)")
 
         data = {
             "model": self.model,

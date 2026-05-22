@@ -1041,13 +1041,22 @@ class MaxwellBot(commands.Bot):
         return active
 
     @staticmethod
+    def _current_binary_media(media: list[dict]) -> list[dict]:
+        return [
+            item for item in media
+            if item.get("b64") and not item.get("is_text") and not item.get("is_image")
+        ]
+
+    @staticmethod
     def _format_media_summary(current_media: list[dict], active_media: list[dict]) -> str:
         current_images = [item for item in current_media if item.get("is_image")]
         current_other = [item for item in current_media if not item.get("is_image")]
+        active_images = [item for item in active_media if str(item.get("mime_type", "")).startswith("image/")]
+        active_non_images = [item for item in active_media if not str(item.get("mime_type", "")).startswith("image/")]
         parts = []
-        if active_media:
+        if active_images:
             lines = []
-            for i, item in enumerate(active_media, 1):
+            for i, item in enumerate(active_images, 1):
                 filename = item.get("filename", "image")
                 mime = item.get("mime_type", "image")
                 label = "new" if any(item.get("message_id") == cur.get("message_id") and filename == cur.get("filename") for cur in current_images) else "recent"
@@ -1058,9 +1067,18 @@ class MaxwellBot(commands.Bot):
             )
             if len(current_images) > MAX_VISUAL_MEMORY_IMAGES:
                 parts.append(f"Only the latest {MAX_VISUAL_MEMORY_IMAGES} images from this message were kept in visual memory.")
+        if active_non_images:
+            lines = []
+            for i, item in enumerate(active_non_images, 1):
+                filename = item.get("filename", "media")
+                mime = item.get("mime_type", "media")
+                lines.append(f"{i}. {filename} ({mime}, new)")
+            parts.append(
+                "Audio/video available to inspect in the multimodal message payload. Use the actual attached media when answering:\n"
+                + "\n".join(lines)
+            )
         if current_other:
             text_items = [item for item in current_other if item.get("is_text") and item.get("text")]
-            binary_items = [item for item in current_other if item not in text_items]
             for item in text_items:
                 filename = item.get("filename", "attachment")
                 mime = item.get("mime_type", "text/plain")
@@ -1068,9 +1086,6 @@ class MaxwellBot(commands.Bot):
                     f"Readable attachment: {filename} ({mime}). Full file contents follow:\n"
                     f"```text\n{item.get('text', '')}\n```"
                 )
-            if binary_items:
-                names = ", ".join(f"{item.get('filename', 'media')} ({item.get('mime_type', 'media')})" for item in binary_items[:5])
-                parts.append(f"Non-image media attached but not in visual memory: {names}")
         return "\n".join(parts)
 
     def _tick_media_context(self, channel_id: str):
@@ -1101,7 +1116,7 @@ class MaxwellBot(commands.Bot):
         ai_timeout = max(10, min(int(self._control.get("ai_timeout_seconds", 180) or 180), 600))
         _images, media = await self._extract_media(message)
         self._cache_media_context(channel_id, media)
-        active_media = self._get_media_context(channel_id)
+        active_media = self._get_media_context(channel_id) + self._current_binary_media(media)
         media_summary = self._format_media_summary(media, active_media)
         messages = await self._build_messages(message, content, has_media=bool(active_media), media_summary=media_summary)
         try:
@@ -1283,9 +1298,9 @@ class MaxwellBot(commands.Bot):
             system_parts.append("Tools (only when needed): " + " | ".join(descriptions) + "\nCall format exactly: [tool_name]\n{json params}\n[/tool_name]")
         if has_media:
             system_parts.append(
-                "Vision: recent image attachments are available in the visual message payload. Inspect the actual image content directly. "
-                "If multiple images are present, treat them as ordered oldest to newest by the numbered list. "
-                "Do not claim you cannot see images unless no image content was provided to the model."
+                "Multimodal input: recent image attachments and current audio/video attachments are available in the message payload. "
+                "Inspect the actual media content directly. If multiple images are present, treat them as ordered oldest to newest by the numbered list. "
+                "Do not claim you cannot see or hear media unless no media content was provided to the model."
             )
         messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
         memory = await self.memory.get_channel_memory(channel_id)
@@ -1314,7 +1329,7 @@ class MaxwellBot(commands.Bot):
         if media_summary:
             user_parts.append(media_summary)
         elif has_media:
-            user_parts.append("Images available to inspect in visual memory.")
+            user_parts.append("Media available to inspect in the multimodal payload.")
         music = self._get_music_context(message) if self._control.get("music_context_enabled", True) else ""
         if music:
             user_parts.append(music)
