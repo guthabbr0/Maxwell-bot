@@ -366,9 +366,13 @@ class MaxwellBot(commands.Bot):
         if allowed and channel_id not in allowed:
             return
 
+        has_content = bool(message.content)
+        has_attachment = bool(message.attachments)
+        has_embed = bool(getattr(message, "embeds", None))
+
         cooldown = float(self._control.get("per_user_cooldown_seconds", 1.5) or 0)
         last = self._cooldowns.get(str(message.author.id), 0)
-        if cooldown > 0 and now - last < cooldown:
+        if cooldown > 0 and now - last < cooldown and not (has_attachment or has_embed):
             return
         self._cooldowns[str(message.author.id)] = now
         if len(self._cooldowns) > 1000:
@@ -380,9 +384,6 @@ class MaxwellBot(commands.Bot):
                 await self.memory.add_to_channel_memory(channel_id, {"author": self.bot_name, "content": message.content, "message_id": message.id})
             return
 
-        has_content = bool(message.content)
-        has_attachment = bool(message.attachments)
-        has_embed = bool(getattr(message, "embeds", None))
         if not has_content and not has_attachment and not has_embed:
             return
 
