@@ -6,6 +6,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+AUDIO_FORMATS = {
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/ogg": "ogg",
+    "audio/flac": "flac",
+}
+
 MIME_MAP = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -120,9 +132,13 @@ class OllamaProvider:
                     if mime.startswith("image/"):
                         parts.append({"type": "image_url", "image_url": {"url": uri}})
                     elif mime.startswith("audio/"):
-                        parts.append({"type": "audio_url", "audio_url": {"url": uri}})
+                        audio_format = AUDIO_FORMATS.get(mime.split(";", 1)[0].lower())
+                        if audio_format:
+                            parts.append({"type": "input_audio", "input_audio": {"data": b64, "format": audio_format}})
+                        else:
+                            parts.append({"type": "audio_url", "audio_url": {"url": uri}})
                     elif mime.startswith("video/"):
-                        parts.append({"type": "video_url", "video_url": {"url": uri}})
+                        parts.append({"type": "file", "file": {"filename": m.get("filename", "video.mp4"), "file_data": b64}})
                     else:
                         continue
                     attached += 1
