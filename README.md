@@ -120,3 +120,7 @@ Static files (`web/index.html`, `web/admin/index.html`) should be copied to a we
 ## License
 
 MIT. See `LICENSE`.
+
+## Why am I doing this?
+
+Just for fun idk you will see ALOT of ai slop and very specific stuff just made for my code and model so some things like audio recognition and video is for gemini and my website stuff and ect will not work for you sooo uhh yeah (your problem not mine if you have things that will help everyone like universal model selector for like adding models that have video support or dont ect please do a pull request thanks!)
