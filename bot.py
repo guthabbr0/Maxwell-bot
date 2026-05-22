@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import shutil
+import tempfile
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -995,6 +996,15 @@ class MaxwellBot(commands.Bot):
                 if not is_media and not is_text:
                     continue
                 mime = content_type.split(";")[0] if content_type else MIME_MAP.get(ext, "text/plain" if is_text else "application/octet-stream")
+                filename = attachment.filename
+                if mime == "image/gif" or ext == ".gif":
+                    normalized = await self._normalize_gif(blob, attachment.filename, max_size)
+                    if normalized:
+                        blob, mime, filename = normalized
+                if mime.startswith("video/"):
+                    normalized = await self._normalize_video(blob, attachment.filename, max_size)
+                    if normalized:
+                        blob, mime, filename = normalized
                 is_image = ext in image_exts or mime.startswith("image/")
                 text = ""
                 b64 = ""
@@ -1009,7 +1019,7 @@ class MaxwellBot(commands.Bot):
                 item = {
                     "b64": b64,
                     "mime_type": mime,
-                    "filename": attachment.filename,
+                    "filename": filename,
                     "is_image": is_image,
                     "is_text": bool(text),
                     "text": text,
@@ -1017,10 +1027,78 @@ class MaxwellBot(commands.Bot):
                 }
                 media.append(item)
                 kind = "text" if text else "media"
-                logger.info(f"Extracted {kind} attachment {attachment.filename} ({len(blob)} bytes, mime={mime})")
+                logger.info(f"Extracted {kind} attachment {filename} ({len(blob)} bytes, mime={mime})")
             except Exception as e:
                 logger.error(f"Failed to download attachment {attachment.filename}: {e}")
         return images, media
+
+    async def _normalize_video(self, blob: bytes, filename: str, max_size: int) -> tuple[bytes, str, str] | None:
+        suffix = Path(filename).suffix.lower() or ".mp4"
+        try:
+            with tempfile.TemporaryDirectory(prefix="maxwell-video-") as tmp:
+                tmp_path = Path(tmp)
+                input_path = tmp_path / f"input{suffix}"
+                output_path = tmp_path / "normalized.mp4"
+                input_path.write_bytes(blob)
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(input_path),
+                    "-vf", "scale='min(1280,iw)':-2,fps=24,format=yuv420p",
+                    "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
+                    "-preset", "veryfast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    str(output_path),
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _stdout, stderr = await proc.communicate()
+                if proc.returncode != 0 or not output_path.exists():
+                    logger.warning(f"Video normalization failed for {filename}: {stderr.decode(errors='replace')[-300:]}")
+                    return None
+                normalized = output_path.read_bytes()
+                if len(normalized) > max_size:
+                    logger.warning(f"Skipping normalized video {filename}: too large ({len(normalized)} bytes)")
+                    return None
+                out_name = f"{Path(filename).stem}-normalized.mp4"
+                logger.info(f"Normalized video {filename} -> {out_name} ({len(blob)} -> {len(normalized)} bytes)")
+                return normalized, "video/mp4", out_name
+        except Exception as e:
+            logger.warning(f"Failed to normalize video {filename}: {e}")
+            return None
+
+    async def _normalize_gif(self, blob: bytes, filename: str, max_size: int) -> tuple[bytes, str, str] | None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="maxwell-gif-") as tmp:
+                tmp_path = Path(tmp)
+                input_path = tmp_path / "input.gif"
+                output_path = tmp_path / "gif-sheet.jpg"
+                input_path.write_bytes(blob)
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(input_path),
+                    "-vf", "fps=2,scale=320:-2:flags=lanczos,tile=4x2:padding=4:margin=4:color=white",
+                    "-frames:v", "1",
+                    str(output_path),
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _stdout, stderr = await proc.communicate()
+                if proc.returncode != 0 or not output_path.exists():
+                    logger.warning(f"GIF normalization failed for {filename}: {stderr.decode(errors='replace')[-300:]}")
+                    return None
+                normalized = output_path.read_bytes()
+                if len(normalized) > max_size:
+                    logger.warning(f"Skipping normalized GIF {filename}: too large ({len(normalized)} bytes)")
+                    return None
+                out_name = f"{Path(filename).stem}-gif-sheet.jpg"
+                logger.info(f"Normalized GIF {filename} -> {out_name} ({len(blob)} -> {len(normalized)} bytes)")
+                return normalized, "image/jpeg", out_name
+        except Exception as e:
+            logger.warning(f"Failed to normalize GIF {filename}: {e}")
+            return None
 
     @staticmethod
     def _embed_text(embed) -> str:
@@ -1095,6 +1173,10 @@ class MaxwellBot(commands.Bot):
             return None
         if not mime:
             mime = MIME_MAP.get(ext, "application/octet-stream")
+        if mime == "image/gif" or ext == ".gif":
+            normalized = await self._normalize_gif(blob, filename, max_size)
+            if normalized:
+                blob, mime, filename = normalized
         is_image = mime.startswith("image/")
         logger.info(f"Extracted embed media {filename} ({len(blob)} bytes, mime={mime})")
         return {
@@ -1143,6 +1225,27 @@ class MaxwellBot(commands.Bot):
                 "source": "embed",
             })
             logger.info(f"Extracted text from {len(text_blocks)} embed(s)")
+        return media
+
+    async def _extract_gif_links(self, message) -> list[dict]:
+        urls = re.findall(r"https?://[^\s<>()]+", message.content or "")
+        gif_urls = []
+        for url in urls:
+            cleaned = url.rstrip(".,;!?)\"'")
+            path = urlparse(cleaned).path.lower()
+            if path.endswith(".gif"):
+                gif_urls.append(cleaned)
+        if not gif_urls:
+            return []
+        max_mb = float(self._control.get("max_image_size_mb", 10) or 10)
+        max_size = int(max(1, min(max_mb, 25)) * 1024 * 1024)
+        media = []
+        message_id = getattr(message, "id", None)
+        for idx, url in enumerate(gif_urls[:5], 1):
+            item = await self._download_embed_media(url, f"linked-gif-{idx}.gif", max_size, message_id)
+            if item:
+                item["source"] = "gif_link"
+                media.append(item)
         return media
 
     def _cache_media_context(self, channel_id: str, media: list[dict]):
@@ -1249,6 +1352,7 @@ class MaxwellBot(commands.Bot):
         ai_timeout = max(10, min(int(self._control.get("ai_timeout_seconds", 180) or 180), 600))
         _images, media = await self._extract_media(message)
         media.extend(await self._extract_embeds(message))
+        media.extend(await self._extract_gif_links(message))
         self._cache_media_context(channel_id, media)
         cached_media = self._get_media_context(channel_id)
         active_media = cached_media + self._current_binary_media(media)
