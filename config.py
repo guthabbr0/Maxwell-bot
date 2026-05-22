@@ -32,6 +32,7 @@ def _float_env(name: str, default: float, min_value: float = None, max_value: fl
 
 class Config:
     DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", os.getenv("OPENAI_COMPAT_API_KEY", ""))
