@@ -135,8 +135,10 @@ def _json_response(data, status=200):
     )
 
 def _needs_auth(request) -> bool:
-    """All API/data requests need auth except CORS preflight."""
+    """Mutations need auth; GETs and OPTIONS are public read."""
     if request.method == "OPTIONS":
+        return False
+    if request.method == "GET":
         return False
     return True
 
