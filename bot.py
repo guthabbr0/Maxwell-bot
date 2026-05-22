@@ -9,6 +9,7 @@ import shutil
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -381,7 +382,8 @@ class MaxwellBot(commands.Bot):
 
         has_content = bool(message.content)
         has_attachment = bool(message.attachments)
-        if not has_content and not has_attachment:
+        has_embed = bool(getattr(message, "embeds", None))
+        if not has_content and not has_attachment and not has_embed:
             return
 
         async with self._get_channel_lock(channel_id):
@@ -394,6 +396,13 @@ class MaxwellBot(commands.Bot):
                         attachment_names.append(f"{attachment.filename} ({content_type})")
                     attachment_note = "[attachments: " + ", ".join(attachment_names) + "]"
                     memory_content = f"{memory_content} {attachment_note}".strip()
+                if has_embed:
+                    embed_titles = []
+                    for embed in message.embeds[:3]:
+                        title = getattr(embed, "title", None) or getattr(embed, "description", None) or getattr(embed, "url", None) or "embed"
+                        embed_titles.append(str(title)[:120])
+                    embed_note = "[embeds: " + "; ".join(embed_titles) + "]"
+                    memory_content = f"{memory_content} {embed_note}".strip()
                 await self.memory.add_to_channel_memory(channel_id, {
                     "author": message.author.display_name,
                     "author_id": str(message.author.id),
@@ -423,7 +432,7 @@ class MaxwellBot(commands.Bot):
                 if not self._control.get("reply_mentions", True):
                     return
                 clean = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip() if mentioned and self.user else message.content
-                if not clean and not message.attachments:
+                if not clean and not message.attachments and not has_embed:
                     return
                 await self._handle_message(message, (clean or "look at this") + self._get_reply_context(message))
 
@@ -1011,6 +1020,129 @@ class MaxwellBot(commands.Bot):
                 logger.error(f"Failed to download attachment {attachment.filename}: {e}")
         return images, media
 
+    @staticmethod
+    def _embed_text(embed) -> str:
+        lines = []
+        if getattr(embed, "title", None):
+            lines.append(f"Title: {embed.title}")
+        if getattr(embed, "description", None):
+            lines.append(f"Description: {embed.description}")
+        if getattr(embed, "url", None):
+            lines.append(f"URL: {embed.url}")
+        author = getattr(embed, "author", None)
+        if author and getattr(author, "name", None):
+            author_line = f"Author: {author.name}"
+            if getattr(author, "url", None):
+                author_line += f" ({author.url})"
+            lines.append(author_line)
+        provider = getattr(embed, "provider", None)
+        if provider and getattr(provider, "name", None):
+            lines.append(f"Provider: {provider.name}")
+        for field in getattr(embed, "fields", []) or []:
+            name = getattr(field, "name", "field")
+            value = getattr(field, "value", "")
+            if name or value:
+                lines.append(f"Field - {name}: {value}")
+        footer = getattr(embed, "footer", None)
+        if footer and getattr(footer, "text", None):
+            lines.append(f"Footer: {footer.text}")
+        return "\n".join(line for line in lines if line).strip()
+
+    @staticmethod
+    def _embed_media_urls(embed) -> list[tuple[str, str]]:
+        urls = []
+        for label, obj_name in (("image", "image"), ("thumbnail", "thumbnail"), ("video", "video")):
+            obj = getattr(embed, obj_name, None)
+            url = getattr(obj, "url", None) or getattr(obj, "proxy_url", None)
+            if url:
+                urls.append((label, str(url)))
+        author = getattr(embed, "author", None)
+        if author and getattr(author, "icon_url", None):
+            urls.append(("author_icon", str(author.icon_url)))
+        footer = getattr(embed, "footer", None)
+        if footer and getattr(footer, "icon_url", None):
+            urls.append(("footer_icon", str(footer.icon_url)))
+        seen = set()
+        unique = []
+        for label, url in urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            unique.append((label, url))
+        return unique
+
+    async def _download_embed_media(self, url: str, filename: str, max_size: int, message_id) -> dict | None:
+        if not _is_safe_url(url):
+            logger.warning(f"Skipping unsafe embed media URL: {url[:120]}")
+            return None
+        ext = Path(urlparse(url).path).suffix.lower()
+        try:
+            session = await _get_shared_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20, connect=8)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Skipping embed media {url[:120]}: HTTP {resp.status}")
+                    return None
+                content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                mime = content_type or MIME_MAP.get(ext, "")
+                if not mime.startswith(("image/", "video/", "audio/")):
+                    logger.warning(f"Skipping embed media {url[:120]}: unsupported mime {mime or 'unknown'}")
+                    return None
+                blob = await _read_response_limited(resp, max_size)
+        except Exception as e:
+            logger.warning(f"Failed to download embed media {url[:120]}: {e}")
+            return None
+        if not mime:
+            mime = MIME_MAP.get(ext, "application/octet-stream")
+        is_image = mime.startswith("image/")
+        logger.info(f"Extracted embed media {filename} ({len(blob)} bytes, mime={mime})")
+        return {
+            "b64": base64.b64encode(blob).decode("utf-8"),
+            "mime_type": mime,
+            "filename": filename,
+            "is_image": is_image,
+            "is_text": False,
+            "text": "",
+            "message_id": message_id,
+            "source": "embed",
+        }
+
+    async def _extract_embeds(self, message) -> list[dict]:
+        embeds = list(getattr(message, "embeds", []) or [])
+        if not embeds:
+            return []
+        max_mb = float(self._control.get("max_image_size_mb", 10) or 10)
+        max_size = int(max(1, min(max_mb, 25)) * 1024 * 1024)
+        media = []
+        text_blocks = []
+        message_id = getattr(message, "id", None)
+        media_count = 0
+        for idx, embed in enumerate(embeds[:5], 1):
+            text = self._embed_text(embed)
+            if text:
+                text_blocks.append(f"Embed {idx}:\n{text}")
+            for label, url in self._embed_media_urls(embed):
+                if media_count >= 5:
+                    break
+                ext = Path(urlparse(url).path).suffix.lower()
+                filename = f"embed-{idx}-{label}{ext or ''}"
+                item = await self._download_embed_media(url, filename, max_size, message_id)
+                if item:
+                    media.append(item)
+                    media_count += 1
+        if text_blocks:
+            media.insert(0, {
+                "b64": "",
+                "mime_type": "text/plain",
+                "filename": "discord-embeds.txt",
+                "is_image": False,
+                "is_text": True,
+                "text": "\n\n".join(text_blocks),
+                "message_id": message_id,
+                "source": "embed",
+            })
+            logger.info(f"Extracted text from {len(text_blocks)} embed(s)")
+        return media
+
     def _cache_media_context(self, channel_id: str, media: list[dict]):
         image_media = [item for item in media if item.get("is_image")]
         if not image_media:
@@ -1082,8 +1214,9 @@ class MaxwellBot(commands.Bot):
             for item in text_items:
                 filename = item.get("filename", "attachment")
                 mime = item.get("mime_type", "text/plain")
+                label = "Embed text" if item.get("source") == "embed" else "Readable attachment"
                 parts.append(
-                    f"Readable attachment: {filename} ({mime}). Full file contents follow:\n"
+                    f"{label}: {filename} ({mime}). Full contents follow:\n"
                     f"```text\n{item.get('text', '')}\n```"
                 )
         return "\n".join(parts)
@@ -1115,6 +1248,7 @@ class MaxwellBot(commands.Bot):
             self._active_requests[channel_id] = current_task
         ai_timeout = max(10, min(int(self._control.get("ai_timeout_seconds", 180) or 180), 600))
         _images, media = await self._extract_media(message)
+        media.extend(await self._extract_embeds(message))
         self._cache_media_context(channel_id, media)
         active_media = self._get_media_context(channel_id) + self._current_binary_media(media)
         media_summary = self._format_media_summary(media, active_media)
