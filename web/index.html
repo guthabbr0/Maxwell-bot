@@ -222,6 +222,25 @@ function tx(id,t){const e=$(id);if(e)e.textContent=t}
 function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
 function pill(cls,v){return '<span class="pill '+cls+'">'+esc(v)+'</span>'}
 
+function getAuthHeaders(){
+  try{
+    const creds=JSON.parse(localStorage.getItem('maxwellAuth')||'{}');
+    if(creds.u&&creds.p)return{'Authorization':'Basic '+btoa(creds.u+':'+creds.p)};
+  }catch(e){}
+  return{};
+}
+async function apiFetch(url,options={}){
+  const headers=Object.assign({},options.headers||{},getAuthHeaders());
+  const res=await fetch(url,Object.assign({},options,{headers}));
+  if(res.status===401){
+    const st=$('statusTag');
+    if(st){st.textContent='UNAUTHORIZED';st.className='status-tag off'}
+    const ld=$('liveDot');
+    if(ld)ld.className='live-dot off';
+  }
+  return res;
+}
+
 const CONTROL_KEYS=[
   ['bot_enabled','Bot'],['reply_dms','DMs'],['reply_groups','Groups'],
   ['reply_mentions','Mentions'],['auto_mode_enabled','Auto'],['tools_enabled','Tools'],['store_memory','Memory'],['cross_context_enabled','Context']
@@ -274,10 +293,7 @@ function renderControls(control){
       try{
         const control={};
         control[key]=newVal;
-        const creds=JSON.parse(localStorage.getItem('maxwellAuth')||'{}');
-        const headers={'Content-Type':'application/json'};
-        if(creds.u&&creds.p)headers.Authorization='Basic '+btoa(creds.u+':'+creds.p);
-        const r=await fetch('/api/control',{method:'PUT',headers,body:JSON.stringify(control)});
+        const r=await apiFetch('/api/control',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(control)});
         if(r.ok){el.classList.toggle('on');el.classList.toggle('off')}
       }catch(e){}
     });
@@ -301,15 +317,15 @@ function fmtBytes(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(
 async function loadData(){
   try{
     const[memories,sites,prompts,channelMemory,autoChannels,blacklist,controlData,statusData,commands]=await Promise.all([
-      fetch('/data/long_term_memory.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
-      fetch('/data/sites.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
-      fetch('/data/prompts.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
-      fetch('/data/memory.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
-      fetch('/data/auto_channels.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
-      fetch('/data/blacklist.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
-      fetch('/data/bot_control.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
-      fetch('/api/status').then(r=>r.ok?r.json():null).catch(()=>null),
-      fetch('/api/commands').then(r=>r.ok?r.json():[]).catch(()=>[])
+      apiFetch('/data/long_term_memory.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
+      apiFetch('/data/sites.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      apiFetch('/data/prompts.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      apiFetch('/data/memory.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      apiFetch('/data/auto_channels.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
+      apiFetch('/data/blacklist.json').then(r=>r.ok?r.json():[]).catch(()=>[]),
+      apiFetch('/data/bot_control.json').then(r=>r.ok?r.json():{}).catch(()=>{}),
+      apiFetch('/api/status').then(r=>r.ok?r.json():null).catch(()=>null),
+      apiFetch('/api/commands').then(r=>r.ok?r.json():[]).catch(()=>[])
     ]);
 
     const memArr=Array.isArray(memories)?memories:[];
@@ -390,7 +406,7 @@ async function loadData(){
 
 async function loadSystem(){
   try{
-    const r=await fetch('/api/system');
+    const r=await apiFetch('/api/system');
     if(!r.ok)return;
     const d=await r.json();
     if(d.load){

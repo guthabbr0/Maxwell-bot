@@ -827,10 +827,14 @@ async def control_reset(request):
 
 # ---------- REM ----------
 async def rem_status(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     return _json_response(_load_rem_status())
 
 
 async def rem_runs(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     runs = _safe_list(_load(_rem_runs_path()))
     try:
         limit = max(1, min(int(request.query.get("limit", "50")), 200))
@@ -952,6 +956,8 @@ async def commands_post(request):
 
 
 async def commands_get(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     cmds = _load_commands()
     return _json_response(cmds[-100:])
 
@@ -981,6 +987,8 @@ async def _pm2_json():
 
 
 async def pm2_status(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     data = await _pm2_json()
     wanted = {"maxwell-bot", "maxwell-api"}
     out = []
@@ -1003,6 +1011,8 @@ async def pm2_status(request):
 
 
 async def pm2_logs(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     process = request.query.get("process", "maxwell-bot")
     lines = request.query.get("lines", "30")
     try:
@@ -1057,6 +1067,8 @@ async def pm2_restart(request):
 
 
 async def channel_list(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     mem = _safe_object(_load(DATA_DIR / "memory.json"))
     out = []
     for cid, msgs in mem.items():
@@ -1070,6 +1082,8 @@ async def channel_list(request):
 
 
 async def chat_history(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     cid = request.query.get("channel_id", "")
     if not cid:
         return _json_response({"error": "channel_id required"}, 400)
@@ -1130,6 +1144,8 @@ async def login_post(request):
 
 # ---------- System Stats ----------
 async def system_stats(request):
+    if not _has_admin_auth(request):
+        return _json_response({"error": "unauthorized"}, 401)
     try:
         proc = await asyncio.create_subprocess_exec(
             "cat", "/proc/loadavg",

@@ -6,6 +6,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+USAGE_EXHAUSTED_MESSAGE = "The api is down cuz yall drained the usage and im not rich so wait like 2 hours"
+
 AUDIO_FORMATS = {
     "audio/wav": "wav",
     "audio/x-wav": "wav",
@@ -35,6 +37,28 @@ MIME_MAP = {
     ".m4a": "audio/mp4",
     ".flac": "audio/flac",
 }
+
+
+class ProviderUsageExhaustedError(RuntimeError):
+    """Raised when the upstream provider is out of quota, credits, or cooldown capacity."""
+
+    user_message = USAGE_EXHAUSTED_MESSAGE
+
+
+def _is_usage_exhausted_error(status: int, error_text: str) -> bool:
+    text = (error_text or "").lower()
+    markers = (
+        "model_cooldown",
+        "cooling down",
+        "quota",
+        "insufficient_quota",
+        "insufficient credits",
+        "credit balance",
+        "usage",
+        "rate limit",
+        "rate_limit",
+    )
+    return status == 429 and any(marker in text for marker in markers)
 
 
 class OllamaProvider:
@@ -194,6 +218,8 @@ class OllamaProvider:
                         raise RuntimeError(f"Provider overloaded after retries: {error_text[:200]}")
                     if resp.status == 429:
                         error_text = await resp.text()
+                        if _is_usage_exhausted_error(resp.status, error_text):
+                            raise ProviderUsageExhaustedError(f"Provider usage exhausted: {error_text[:200]}")
                         if attempt < 3:
                             wait = attempt * 2
                             logger.warning(f"Provider 429 rate limited (attempt {attempt}/3), retrying in {wait}s...")

@@ -721,19 +721,31 @@ function adminPanel(){
     actionCustomStatus:'',actionAvatarUrl:'',actionShellCmd:'',actionShellResult:'',
     actionClearChannelId:'',commandHistory:[],
     async init(){
-      this.adminUser=localStorage.getItem('maxwellAdminUser')||'';
+      const auth = localStorage.getItem('maxwellAuth');
+      if(auth){
+        try{
+          const parsed = JSON.parse(auth);
+          this.adminUser = parsed.u || '';
+          this.adminPass = parsed.p || '';
+        }catch(e){}
+      }
+      if(!this.adminUser){
+        this.adminUser=localStorage.getItem('maxwellAdminUser')||'';
+      }
       await this.loadAll();
       setInterval(()=>this.loadAll(),30000);
     },
     saveLogin(){
       this.adminUser=this.adminUser.trim();
       localStorage.setItem('maxwellAdminUser',this.adminUser);
+      localStorage.setItem('maxwellAuth',JSON.stringify({u:this.adminUser,p:this.adminPass}));
       this.apiFetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:this.adminUser,pass:this.adminPass})})
         .then(d=>{if(d.ok)this.showMsg('Login valid for this tab','ok');else this.showMsg('Error: '+(d.error||'unknown'),'err')})
         .catch(e=>this.showMsg('Error: '+e.message,'err'));
     },
     clearLogin(){
       localStorage.removeItem('maxwellAdminUser');
+      localStorage.removeItem('maxwellAuth');
       this.adminUser='';this.adminPass='';this.showMsg('Login cleared','ok');
     },
     async apiFetch(url,options={}){

@@ -28,6 +28,7 @@ from bot_tools import (
     ForwardMessageTool,
     HDImageGeneratorTool,
     ImageGeneratorTool,
+    KiloTool,
     ListServersTool,
     ListSitesTool,
     LookupUserTool,
@@ -41,6 +42,7 @@ from bot_tools import (
     SetNicknameTool,
     ShellTool,
     TypingTool,
+    TtsTool,
     WebSearchTool,
     OWNER_IDS,
     close_shared_session,
@@ -50,7 +52,7 @@ from bot_tools import (
 )
 from config import Config
 from memory import MemoryManager, RemEventLog
-from providers import MIME_MAP, OllamaProvider
+from providers import MIME_MAP, OllamaProvider, ProviderUsageExhaustedError
 from rem import RemStore, load_rem_defaults, run_rem_once
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -240,6 +242,7 @@ class MaxwellBot(commands.Bot):
         self._control = dict(DEFAULT_CONTROL)
         self._control_mtime = 0
         self._reaction_seen: set[str] = set()  # "{message_id}:{emoji}" dedup
+        self._recorded_rem_msg_ids: set[int] = set()  # "message_id" dedup for REM events
         self._context_tasks: set[asyncio.Task] = set()
         self._tasks = []
         self._setup_ai()
@@ -276,6 +279,7 @@ class MaxwellBot(commands.Bot):
         self.tools["set_nickname"] = SetNicknameTool(self)
         self.tools["forward_message"] = ForwardMessageTool(self)
         self.tools["typing"] = TypingTool(self)
+        self.tools["tts"] = TtsTool(self)
         self.tools["list_servers"] = ListServersTool(self)
         self.tools["change_avatar"] = ChangeAvatarTool(self)
         self.tools["create_site"] = CreateSiteTool(self)
@@ -442,6 +446,8 @@ class MaxwellBot(commands.Bot):
                     "content": memory_content or "[media attached]",
                     "message_id": message.id,
                 })
+                if self.rem_log:
+                    await self._record_rem_event(message, "user", memory_content)
             self._maybe_schedule_context_extraction(message)
 
             if isinstance(message.channel, discord.DMChannel):
@@ -1039,6 +1045,14 @@ class MaxwellBot(commands.Bot):
 
     async def _record_rem_event(self, message, role: str, content: str | None = None):
         try:
+            msg_id = getattr(message, "id", None)
+            if msg_id and role == "user":
+                if msg_id in self._recorded_rem_msg_ids:
+                    return
+                self._recorded_rem_msg_ids.add(msg_id)
+                if len(self._recorded_rem_msg_ids) > 1000:
+                    self._recorded_rem_msg_ids = set(list(self._recorded_rem_msg_ids)[-500:])
+
             visible = self._visible_event_content(message, content)
             if not visible:
                 return
@@ -1958,6 +1972,13 @@ class MaxwellBot(commands.Bot):
                     if len(chunks) > 1:
                         await asyncio.sleep(0.3)
                 await self._record_rem_event(message, "assistant", response)
+        except ProviderUsageExhaustedError as e:
+            logger.warning(f"Provider usage exhausted while handling message: {e}")
+            if self._control.get("error_replies", True):
+                try:
+                    await message.channel.send(e.user_message)
+                except discord.Forbidden:
+                    pass
         except Exception as e:
             logger.error(f"Error handling message: {e}\n{traceback.format_exc()}")
             if self._control.get("error_replies", True):
@@ -2126,11 +2147,11 @@ class MaxwellBot(commands.Bot):
                 if current_message_id is not None and msg.get("message_id") == current_message_id:
                     continue
                 if msg.get("is_tool"):
-                    line = f"[Tool] {msg.get('content', '')[:150]}"
+                    line = f"[Tool] {msg.get('content', '')[:4000]}"
                 elif msg.get("author") == (self.user.display_name if self.user else self.bot_name):
-                    line = f"You: {msg.get('content', '')[:220]}"
+                    line = f"You: {msg.get('content', '')[:4000]}"
                 else:
-                    line = f"{msg.get('author', '?')}: {msg.get('content', '')[:220]}"
+                    line = f"{msg.get('author', '?')}: {msg.get('content', '')[:4000]}"
                 if used + len(line) > budget:
                     break
                 lines.append(line)
@@ -2290,7 +2311,7 @@ class MaxwellBot(commands.Bot):
                         used = 0
                         lines = []
                         for msg in reversed(memory[-15:]):
-                            line = f"{msg.get('author', '?')}: {msg.get('content', '')[:220]}"
+                            line = f"{msg.get('author', '?')}: {msg.get('content', '')[:4000]}"
                             if used + len(line) > 5000:
                                 break
                             lines.append(line)
@@ -2308,7 +2329,11 @@ class MaxwellBot(commands.Bot):
                     try:
                         async with session.post(f"{url_base}/sendChatAction", json={"chat_id": chat_id, "action": "typing"}):
                             pass
-                        response_text = await self.ai_provider.generate_response(messages, media=tg_media, timeout=30)
+                        try:
+                            response_text = await self.ai_provider.generate_response(messages, media=tg_media, timeout=30)
+                        except ProviderUsageExhaustedError as e:
+                            logger.warning(f"Provider usage exhausted while handling Telegram message: {e}")
+                            response_text = e.user_message
                     finally:
                         await self._release_ai_slot()
                         

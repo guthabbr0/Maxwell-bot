@@ -1484,3 +1484,103 @@ class KiloTool(Tool):
 
         return combined if combined else "Kilo ran successfully with no output."
 
+
+class TtsTool(Tool):
+    """Text to Speech generator tool"""
+
+    def get_description(self):
+        return (
+            "Convert a text response into a speech voice message and send it to the triggering channel. "
+            "Params: text (required string)."
+        )
+
+    async def execute(self, message: Message, text: str = None, **kwargs) -> str:
+        if not text or not text.strip():
+            return "Error: text parameter is required"
+
+        import wave
+        import os
+        import discord
+
+        # Determine API Key and Setup File
+        nvidia_api_key = os.environ.get("NVIDIA_API_KEY", "")
+        if not nvidia_api_key:
+            return "Error: NVIDIA_API_KEY is not configured"
+
+        filename = f"tts_{message.id}.wav"
+        used_fallback = False
+        error_details = ""
+
+        try:
+            # Try NVIDIA Riva TTS
+            import riva.client
+            from riva.client.proto.riva_audio_pb2 import AudioEncoding
+
+            auth = riva.client.Auth(
+                use_ssl=True,
+                uri="grpc.nvcf.nvidia.com:443",
+                metadata_args=[
+                    ["function-id", "877104f7-e885-42b9-8de8-f6e4c6303969"],
+                    ["authorization", f"Bearer {nvidia_api_key}"]
+                ],
+                options=[
+                    ('grpc.max_receive_message_length', 64 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 64 * 1024 * 1024)
+                ]
+            )
+            service = riva.client.SpeechSynthesisService(auth)
+
+            # Use gRPC service synchronously (run in executor since it is synchronous gRPC)
+            def run_riva():
+                return service.synthesize(
+                    text=text,
+                    voice_name="Jason",
+                    language_code="en-US",
+                    sample_rate_hz=44100,
+                    encoding=AudioEncoding.LINEAR_PCM,
+                    custom_configuration={"emotion": "Angry"}
+                )
+
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, run_riva)
+
+            # Save the WAV file
+            with wave.open(filename, 'wb') as out_f:
+                out_f.setnchannels(1)
+                out_f.setsampwidth(2)
+                out_f.setframerate(44100)
+                out_f.writeframesraw(resp.audio)
+
+        except Exception as e:
+            error_details = str(e)
+            logger.warning(f"Riva TTS synthesis failed: {e}. Falling back to gTTS.")
+            # Fallback to local basic gTTS
+            try:
+                from gtts import gTTS
+
+                def run_gtts():
+                    tts = gTTS(text=text, lang='en')
+                    tts.save(filename)
+
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, run_gtts)
+                used_fallback = True
+            except Exception as fallback_err:
+                return f"Error: Riva TTS failed ({e}) and fallback gTTS failed ({fallback_err})"
+
+        # Send file to discord channel
+        if os.path.exists(filename):
+            try:
+                await message.reply(file=discord.File(filename))
+                status = "Synthesized using NVIDIA Riva TTS" if not used_fallback else f"Synthesized using fallback local gTTS (Riva failed: {error_details})"
+                return status
+            except Exception as discord_err:
+                return f"Error sending audio file to channel: {discord_err}"
+            finally:
+                if os.path.exists(filename):
+                    try:
+                        os.remove(filename)
+                    except Exception:
+                        pass
+        else:
+            return f"Error: Audio file {filename} was not generated"

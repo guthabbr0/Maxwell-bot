@@ -189,9 +189,9 @@ class RemEventLog:
 class MemoryManager:
     """Memory manager with async I/O, debounced saves, and atomic writes."""
 
-    def __init__(self, data_dir: str, max_messages: int = 30):
+    def __init__(self, data_dir: str, max_messages: int = 100):
         self.data_dir = Path(data_dir)
-        self.max_messages = min(max_messages, 30)
+        self.max_messages = min(max_messages, 500)
         self.memory_file = self.data_dir / "memory.json"
         self.ltm_file = self.data_dir / "long_term_memory.txt"
         self.shared_context_file = self.data_dir / "shared_context.json"
