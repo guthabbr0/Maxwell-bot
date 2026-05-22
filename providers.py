@@ -138,7 +138,7 @@ class OllamaProvider:
                         else:
                             parts.append({"type": "audio_url", "audio_url": {"url": uri}})
                     elif mime.startswith("video/"):
-                        parts.append({"type": "file", "file": {"filename": m.get("filename", "video.mp4"), "file_data": b64}})
+                        parts.append({"type": "video_url", "video_url": {"url": uri}})
                     else:
                         continue
                     attached += 1
