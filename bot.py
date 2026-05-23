@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import shutil
+import sys
 import tempfile
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -55,7 +56,25 @@ from memory import MemoryManager, RemEventLog
 from providers import MIME_MAP, OllamaProvider, ProviderUsageExhaustedError
 from rem import RemStore, load_rem_defaults, run_rem_once
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+class _MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int):
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+_log_format = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setFormatter(_log_format)
+_stdout_handler.addFilter(_MaxLevelFilter(logging.WARNING))
+
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setFormatter(_log_format)
+_stderr_handler.setLevel(logging.ERROR)
+
+logging.basicConfig(level=logging.INFO, handlers=[_stdout_handler, _stderr_handler])
 logger = logging.getLogger(__name__)
 
 MAX_VISUAL_MEMORY_IMAGES = 3
