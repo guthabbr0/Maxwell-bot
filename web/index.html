@@ -232,12 +232,6 @@ function getAuthHeaders(){
 async function apiFetch(url,options={}){
   const headers=Object.assign({},options.headers||{},getAuthHeaders());
   const res=await fetch(url,Object.assign({},options,{headers}));
-  if(res.status===401){
-    const st=$('statusTag');
-    if(st){st.textContent='UNAUTHORIZED';st.className='status-tag off'}
-    const ld=$('liveDot');
-    if(ld)ld.className='live-dot off';
-  }
   return res;
 }
 
