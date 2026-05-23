@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 
 MAX_VISUAL_MEMORY_IMAGES = 3
 MEDIA_CONTEXT_USES = 11
+CUSTOM_EMOJI_ALIAS_RE = re.compile(r"(?<!<)(?<!<a):([A-Za-z0-9_]{2,32}):(?!\d)")
+TOOL_LINE_RE = re.compile(r"(?im)^\s*(?:TOOL|CALL)\s+([A-Za-z_]\w*)\s*[:\-]?\s*")
 TEXT_MIME_TYPES = {
     "application/json",
     "application/javascript",
@@ -86,6 +88,119 @@ TEXT_ATTACHMENT_EXTS = {
     ".sql", ".svelte", ".swift", ".toml", ".ts", ".tsx", ".txt", ".vim",
     ".vue", ".xml", ".yaml", ".yml", ".zig",
 }
+
+
+def render_custom_emoji_aliases(text: str, emojis: dict[str, str]) -> str:
+    if not text or not emojis:
+        return text
+
+    def replace(match: re.Match) -> str:
+        return emojis.get(match.group(1).lower(), match.group(0))
+
+    return CUSTOM_EMOJI_ALIAS_RE.sub(replace, text)
+
+
+def extract_json_object(text: str, start: int = 0) -> tuple[str, int] | None:
+    i = start
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text) or text[i] != "{":
+        return None
+    depth = 0
+    in_str = False
+    j = i
+    while j < len(text):
+        c = text[j]
+        if in_str:
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[i:j + 1], j + 1
+        j += 1
+    return None
+
+
+def _tool_params_from_json(obj: dict) -> tuple[str | None, dict]:
+    name = obj.get("tool") or obj.get("name") or obj.get("action")
+    if not isinstance(name, str):
+        return None, {}
+    params = obj.get("args") or obj.get("params")
+    if isinstance(params, dict):
+        return name, params
+    return name, {k: v for k, v in obj.items() if k not in {"tool", "name", "action"}}
+
+
+def collect_tool_calls(response: str, available_tools: set[str], disabled_tools: set[str] | None = None) -> list[tuple[int, int, str, dict]]:
+    disabled_tools = disabled_tools or set()
+    calls = []
+
+    def add_call(start: int, end: int, name: str, params: dict):
+        if name in available_tools and name not in disabled_tools:
+            calls.append((start, end, name, params))
+
+    for match in re.finditer(r"\[(?:TOOL_CALL:)?(\w+)\s*\]", response):
+        name = match.group(1)
+        result = extract_json_object(response, match.end())
+        if not result:
+            continue
+        json_str, end = result
+        try:
+            params = json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(params, dict):
+            close = re.match(r"\s*\[/" + re.escape(name) + r"\]", response[end:])
+            add_call(match.start(), end + (close.end() if close else 0), name, params)
+
+    for match in TOOL_LINE_RE.finditer(response):
+        name = match.group(1)
+        result = extract_json_object(response, match.end())
+        if not result:
+            continue
+        json_str, end = result
+        try:
+            params = json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(params, dict):
+            add_call(match.start(), end, name, params)
+
+    for match in re.finditer(r"{", response):
+        if any(start <= match.start() < end for start, end, _name, _params in calls):
+            continue
+        result = extract_json_object(response, match.start())
+        if not result:
+            continue
+        json_str, end = result
+        try:
+            obj = json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        name, params = _tool_params_from_json(obj)
+        if name:
+            add_call(match.start(), end, name, params)
+
+    calls.sort(key=lambda x: (x[0], x[1]))
+    deduped = []
+    seen = set()
+    for call in calls:
+        key = (call[0], call[1], call[2])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(call)
+    return deduped
 
 
 def _looks_like_text(blob: bytes) -> bool:
@@ -372,11 +487,15 @@ class MaxwellBot(commands.Bot):
             gid = str(guild.id)
             self._guild_emojis[gid] = {}
             for emoji in guild.emojis:
-                if not emoji.animated:
-                    self._guild_emojis[gid][emoji.name.lower()] = f"<:{emoji.name}:{emoji.id}>"
+                self._guild_emojis[gid][emoji.name.lower()] = str(emoji)
             logger.info(f"Loaded {len(self._guild_emojis[gid])} emojis for guild {guild.name}")
         total = sum(len(v) for v in self._guild_emojis.values())
         logger.info(f"Loaded {total} total custom emojis across {len(self._guild_emojis)} guilds")
+
+    def _render_custom_emojis(self, text: str, guild) -> str:
+        if not guild:
+            return text
+        return render_custom_emoji_aliases(text, self._guild_emojis.get(str(guild.id), {}))
 
     async def on_message(self, message):
         self._load_control()
@@ -1968,6 +2087,7 @@ class MaxwellBot(commands.Bot):
             response = response.replace("__NO_RESPONSE__", "").replace("__SHELL_SENT__", "").replace("__MEME_SENT__", "").replace("__MEDIA_SENT__", "").strip()
             response = re.sub(r"(?m)^\s*\*[^*]+\*\s*$", "", response).strip() or response.strip()
             if response:
+                response = self._render_custom_emojis(response, message.guild)
                 chunks = self._split_response(response, limit=1900)
                 for i, chunk in enumerate(chunks):
                     if i == 0:
@@ -2004,49 +2124,7 @@ class MaxwellBot(commands.Bot):
         if not self._control.get("tools_enabled", True):
             return response, []
         disabled = set(self._control.get("disabled_tools", []) or [])
-        calls = []
-
-        def extract_json(text, start):
-            i = start
-            while i < len(text) and text[i].isspace():
-                i += 1
-            if i >= len(text) or text[i] != "{":
-                return None
-            depth = 0
-            in_str = False
-            j = i
-            while j < len(text):
-                c = text[j]
-                if in_str:
-                    if c == "\\":
-                        j += 2
-                        continue
-                    if c == '"':
-                        in_str = False
-                else:
-                    if c == '"':
-                        in_str = True
-                    elif c == "{":
-                        depth += 1
-                    elif c == "}":
-                        depth -= 1
-                        if depth == 0:
-                            return text[i:j + 1], j + 1
-                j += 1
-            return None
-
-        for match in re.finditer(r"\[(?:TOOL_CALL:)?(\w+)\s*\]", response):
-            name = match.group(1)
-            if name not in self.tools or name in disabled:
-                continue
-            result = extract_json(response, match.end())
-            if not result:
-                continue
-            json_str, end = result
-            try:
-                calls.append((match.start(), end, name, json.loads(json_str)))
-            except json.JSONDecodeError:
-                pass
+        calls = collect_tool_calls(response, set(self.tools), disabled)
         if not calls:
             return response, []
         calls.sort(key=lambda x: x[0])
@@ -2130,10 +2208,24 @@ class MaxwellBot(commands.Bot):
             emojis = self._guild_emojis.get(str(message.guild.id), {})
             if emojis:
                 items = sorted(emojis.items())[:50]
-                system_parts.append("Available emojis: " + ", ".join(f"{name}={code}" for name, code in items))
+                system_parts.append(
+                    "Available custom emojis: "
+                    + ", ".join(f":{name}:" for name, _code in items)
+                    + ". If you want to use one in chat, write exactly its :name: alias; Maxwell will render it. "
+                    "Do not write raw Discord emoji IDs."
+                )
         if self.tools:
             descriptions = [f"{name}: {tool.get_description()}" for name, tool in self.tools.items()]
-            system_parts.append("Tools (only when needed): " + " | ".join(descriptions) + "\nCall format exactly: [tool_name]\n{json params}\n[/tool_name]")
+            system_parts.append(
+                "Tools are optional. Use them only when they actually help. Available tools: "
+                + " | ".join(descriptions)
+                + "\nTo call a tool, output one plain JSON object on its own line and nothing else for that tool call: "
+                '{"tool":"tool_name","param":"value"}. '
+                "Use exact tool names. Put parameters directly in the object, or under an args object. "
+                "Examples: {\"tool\":\"react\",\"emoji\":\"catjam\"} or "
+                "{\"tool\":\"web_search\",\"query\":\"latest thing\"}. "
+                "After tool results are returned, answer normally. Do not wrap tool calls in markdown."
+            )
         if has_media:
             system_parts.append(
                 "Multimodal input: recent image attachments and current audio/video attachments are available in the message payload. "
