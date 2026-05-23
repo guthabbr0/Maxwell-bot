@@ -1115,10 +1115,15 @@ class MaxwellBot(commands.Bot):
                 await message.channel.send("join a voice channel first")
                 return
             vc = discord.utils.get(self.voice_clients, guild=message.guild) if message.guild else None
-            if vc and vc.is_connected():
-                await vc.move_to(target.channel)
-            else:
-                await target.channel.connect(self_deaf=False, self_mute=False)
+            try:
+                if vc and vc.is_connected():
+                    await vc.move_to(target.channel)
+                else:
+                    await target.channel.connect(self_deaf=False, self_mute=False)
+            except RuntimeError as e:
+                logger.exception("Voice channel join failed")
+                await message.channel.send(f"couldn't join voice: {e}")
+                return
             await message.channel.send(f"joined **{target.channel.name}**")
             return
         if sub == "leave":
