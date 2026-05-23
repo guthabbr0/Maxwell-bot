@@ -66,6 +66,11 @@ See `.env.example` for a full template. Key variables:
 | `OLLAMA_REM_MODEL` | No | Optional REM dreamer model (defaults to `OLLAMA_MODEL`) |
 | `OLLAMA_MAX_TOKENS` | No | Max tokens (default: 200000) |
 | `OLLAMA_TEMPERATURE` | No | Temperature (default: 1.0) |
+| `OLLAMA_FALLBACK_BASE_URL` | No | Optional secondary OpenAI-compatible API base URL. Attempts rotate primary/fallback when set. |
+| `OLLAMA_FALLBACK_API_KEY` | No | Bearer token for the fallback LLM API. |
+| `OLLAMA_FALLBACK_MODEL` | No | Model name for the fallback provider. |
+| `OLLAMA_FALLBACK_DISABLE_REASONING` | No | Add OpenRouter-compatible reasoning exclusion on fallback calls (default: `true`). |
+| `OLLAMA_RETRY_ATTEMPTS` | No | Total provider attempts per request (default: `3`; with fallback: primary, fallback, primary). |
 | `NVIDIA_API_KEY` | No | NVIDIA NIM API key for HD image generation |
 | `GPT_IMAGE_URL` | No | GPT-compatible image generation endpoint |
 | `GPT_IMAGE_API_KEY` | No | API key for GPT image endpoint |

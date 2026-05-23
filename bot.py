@@ -256,6 +256,11 @@ class MaxwellBot(commands.Bot):
             max_tokens=self.config.OLLAMA_MAX_TOKENS,
             temperature=self.config.OLLAMA_TEMPERATURE,
             api_key=self.config.OLLAMA_API_KEY,
+            fallback_base_url=self.config.OLLAMA_FALLBACK_BASE_URL,
+            fallback_model=self.config.OLLAMA_FALLBACK_MODEL,
+            fallback_api_key=self.config.OLLAMA_FALLBACK_API_KEY,
+            fallback_disable_reasoning=self.config.OLLAMA_FALLBACK_DISABLE_REASONING,
+            retry_attempts=self.config.OLLAMA_RETRY_ATTEMPTS,
         )
 
     def _setup_memory(self):

@@ -3,6 +3,7 @@
 import asyncio
 import aiohttp
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -61,22 +62,85 @@ def _is_usage_exhausted_error(status: int, error_text: str) -> bool:
     return status == 429 and any(marker in text for marker in markers)
 
 
+@dataclass(frozen=True)
+class ProviderEndpoint:
+    name: str
+    base_url: str
+    model: str
+    api_key: str = ""
+    disable_reasoning: bool = False
+
+
 class OllamaProvider:
     """OpenAI-compatible LLM Provider with multimodal support using /v1/chat/completions"""
 
-    def __init__(self, base_url: str, model: str, max_tokens: int, temperature: float, api_key: str = ""):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        api_key: str = "",
+        fallback_base_url: str = "",
+        fallback_model: str = "",
+        fallback_api_key: str = "",
+        fallback_disable_reasoning: bool = True,
+        retry_attempts: int = 3,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.api_key = api_key.strip()
+        self.retry_attempts = max(1, retry_attempts)
+        self._endpoints = [
+            ProviderEndpoint("primary", self.base_url, self.model, self.api_key),
+        ]
+        if fallback_base_url and fallback_model:
+            self._endpoints.append(
+                ProviderEndpoint(
+                    "fallback",
+                    fallback_base_url.rstrip("/"),
+                    fallback_model,
+                    fallback_api_key.strip(),
+                    fallback_disable_reasoning,
+                )
+            )
         self._session = None
         self.available = False
 
-    def _headers(self) -> dict[str, str]:
-        if not self.api_key:
+    def _headers(self, endpoint: ProviderEndpoint = None) -> dict[str, str]:
+        api_key = self.api_key if endpoint is None else endpoint.api_key
+        if not api_key:
             return {}
-        return {"Authorization": f"Bearer {self.api_key}"}
+        return {"Authorization": f"Bearer {api_key}"}
+
+    def _attempt_endpoint(self, attempt: int) -> ProviderEndpoint:
+        return self._endpoints[(attempt - 1) % len(self._endpoints)]
+
+    def _should_wait_before_retry(self, current: ProviderEndpoint, next_endpoint: ProviderEndpoint) -> bool:
+        return current.name == next_endpoint.name
+
+    def _request_payload(
+        self,
+        endpoint: ProviderEndpoint,
+        chat_messages: list[dict],
+        tools: list[dict] = None,
+        model: str = None,
+    ) -> dict:
+        data = {
+            "model": model or endpoint.model if endpoint.name == "primary" else endpoint.model,
+            "messages": chat_messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": False,
+        }
+        if endpoint.disable_reasoning:
+            data["reasoning"] = {"exclude": True}
+        if tools:
+            data["tools"] = tools
+            data["tool_choice"] = "auto"
+        return data
 
     async def _get_session(self):
         if self._session is None or self._session.closed:
@@ -88,23 +152,24 @@ class OllamaProvider:
             await self._session.close()
 
     async def initialize(self):
-        try:
-            session = await self._get_session()
-            async with session.get(
-                f"{self.base_url}/models",
-                timeout=aiohttp.ClientTimeout(total=10),
-                headers=self._headers(),
-            ) as resp:
-                if resp.status == 200:
-                    self.available = True
-                    logger.info(f"Provider initialized: {self.model}")
-                    return True
-                else:
-                    logger.warning(f"Provider /models returned {resp.status}")
-        except Exception as e:
-            self.available = False
-            logger.error(f"Provider initialization failed: {e}")
-        return False
+        session = await self._get_session()
+        initialized = False
+        for endpoint in self._endpoints:
+            try:
+                async with session.get(
+                    f"{endpoint.base_url}/models",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    headers=self._headers(endpoint),
+                ) as resp:
+                    if resp.status == 200:
+                        initialized = True
+                        logger.info(f"Provider endpoint initialized: {endpoint.name} ({endpoint.model})")
+                    else:
+                        logger.warning(f"Provider endpoint {endpoint.name} /models returned {resp.status}")
+            except Exception as e:
+                logger.error(f"Provider endpoint {endpoint.name} initialization failed: {e}")
+        self.available = initialized
+        return initialized
 
     async def generate_response(
         self, messages: list[dict], images: list[str] = None, media: list[dict] = None, timeout: int = 60
@@ -187,43 +252,36 @@ class OllamaProvider:
             else:
                 logger.warning(f"No user message found to attach {len(payload_media)} multimodal item(s)")
 
-        data = {
-            "model": model or self.model,
-            "messages": chat_messages,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "stream": False,
-        }
-        if tools:
-            data["tools"] = tools
-            data["tool_choice"] = "auto"
-
         session = await self._get_session()
         last_error = None
-        for attempt in range(1, 3 + 1):
+        last_usage_error = None
+        for attempt in range(1, self.retry_attempts + 1):
+            endpoint = self._attempt_endpoint(attempt)
+            data = self._request_payload(endpoint, chat_messages, tools=tools, model=model)
             try:
                 async with session.post(
-                    f"{self.base_url}/chat/completions",
+                    f"{endpoint.base_url}/chat/completions",
                     json=data,
                     timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-                    headers=self._headers(),
+                    headers=self._headers(endpoint),
                 ) as resp:
                     if resp.status == 503:
                         error_text = await resp.text()
-                        if attempt < 3:
-                            wait = attempt * 2
-                            logger.warning(f"Provider 503 (attempt {attempt}/3), retrying in {wait}s...")
-                            await asyncio.sleep(wait)
+                        if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} 503"):
                             continue
                         raise RuntimeError(f"Provider overloaded after retries: {error_text[:200]}")
                     if resp.status == 429:
                         error_text = await resp.text()
                         if _is_usage_exhausted_error(resp.status, error_text):
-                            raise ProviderUsageExhaustedError(f"Provider usage exhausted: {error_text[:200]}")
-                        if attempt < 3:
-                            wait = attempt * 2
-                            logger.warning(f"Provider 429 rate limited (attempt {attempt}/3), retrying in {wait}s...")
-                            await asyncio.sleep(wait)
+                            last_usage_error = ProviderUsageExhaustedError(
+                                f"Provider {endpoint.name} usage exhausted: {error_text[:200]}"
+                            )
+                            if len(self._endpoints) == 1:
+                                raise last_usage_error
+                            if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} usage exhausted"):
+                                continue
+                            raise last_usage_error
+                        if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} 429 rate limited"):
                             continue
                         raise RuntimeError(f"Provider rate limited after retries: {error_text[:200]}")
                     if resp.status != 200:
@@ -240,29 +298,41 @@ class OllamaProvider:
                     message = choices[0].get("message", {})
                     content = message.get("content", "")
                     if not content and not message.get("tool_calls"):
-                        if attempt < 3:
-                            wait = attempt * 2
-                            logger.warning(f"Provider returned empty response (attempt {attempt}/3), retrying in {wait}s...")
-                            await asyncio.sleep(wait)
+                        if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} returned empty response"):
                             continue
                         raise RuntimeError("Empty response from provider")
 
                     return message
             except asyncio.TimeoutError:
-                if attempt < 3:
-                    wait = attempt * 2
-                    logger.warning(f"Provider timeout (attempt {attempt}/3), retrying in {wait}s...")
-                    await asyncio.sleep(wait)
+                if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} timeout"):
                     continue
                 raise RuntimeError(f"Provider request timed out after {timeout}s")
-            except RuntimeError:
+            except ProviderUsageExhaustedError:
+                raise
+            except RuntimeError as e:
+                last_error = e
+                if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} error: {e}"):
+                    continue
                 raise
             except Exception as e:
                 last_error = e
-                if attempt < 3:
-                    wait = attempt * 2
-                    logger.warning(f"Provider error (attempt {attempt}/3): {e}, retrying in {wait}s...")
-                    await asyncio.sleep(wait)
+                if await self._retry_after_attempt(attempt, endpoint, f"Provider {endpoint.name} error: {e}"):
                     continue
                 raise RuntimeError(f"Provider call failed: {last_error}")
+        if last_usage_error:
+            raise last_usage_error
         raise RuntimeError("Provider call failed after retries")
+
+    async def _retry_after_attempt(self, attempt: int, endpoint: ProviderEndpoint, reason: str) -> bool:
+        if attempt >= self.retry_attempts:
+            return False
+        next_endpoint = self._attempt_endpoint(attempt + 1)
+        if self._should_wait_before_retry(endpoint, next_endpoint):
+            wait = attempt * 2
+            logger.warning(f"{reason} (attempt {attempt}/{self.retry_attempts}), retrying in {wait}s...")
+            await asyncio.sleep(wait)
+        else:
+            logger.warning(
+                f"{reason} (attempt {attempt}/{self.retry_attempts}), retrying with {next_endpoint.name} provider..."
+            )
+        return True
