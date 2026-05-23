@@ -646,6 +646,12 @@ class MaxwellBot(commands.Bot):
             return
 
         async with self._get_channel_lock(channel_id):
+            if message.reference and not message.reference.resolved and message.reference.message_id:
+                try:
+                    message.reference.resolved = await message.channel.fetch_message(message.reference.message_id)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch referenced message: {e}")
+
             if self._control.get("store_memory", True):
                 memory_content = message.content or ""
                 if message.attachments:
@@ -964,6 +970,12 @@ class MaxwellBot(commands.Bot):
         await message.channel.send("Usage: `,context`, `,context all`, `,context add [scope] <fact>`, `,context forget <id>`, `,context private <id>`, `,context global <id>`")
 
     async def _should_reply_auto(self, message) -> bool:
+        if message.reference and not message.reference.resolved and message.reference.message_id:
+            try:
+                message.reference.resolved = await message.channel.fetch_message(message.reference.message_id)
+            except Exception as e:
+                logger.warning(f"Failed to fetch referenced message in auto decider: {e}")
+
         if message.reference and message.reference.resolved and hasattr(message.reference.resolved, "author") and self.user and message.reference.resolved.author.id == self.user.id:
             return True
         if not message.content and any(a.filename.lower().endswith(".gif") for a in message.attachments):
@@ -992,9 +1004,19 @@ class MaxwellBot(commands.Bot):
                     f"Mentions Maxwell: {'yes' if mentions_maxwell else 'no'}. "
                     "If it mentions other people but not Maxwell, this is probably not Maxwell's conversation."
                 )
+            reply_note = ""
+            if message.reference and message.reference.resolved and hasattr(message.reference.resolved, "author"):
+                ref_author = message.reference.resolved.author.display_name
+                ref_content = getattr(message.reference.resolved, "content", "") or ""
+                is_reply_to_maxwell = bool(self.user and message.reference.resolved.author.id == self.user.id)
+                reply_to_who = "Maxwell" if is_reply_to_maxwell else ref_author
+                reply_note = (
+                    f"\nReply analysis: this message is a direct reply/response to {reply_to_who}. "
+                    f"The message being replied to was from {ref_author}: '{ref_content[:150]}'."
+                )
             messages = [
                 {"role": "system", "content": str(prompt)},
-                {"role": "user", "content": f"Recent context:\n{'\n'.join(recent)}\n\nNew message from {message.author.display_name}: {message.content[:300]}{mention_note}\n\nShould Maxwell reply?"},
+                {"role": "user", "content": f"Recent context:\n{'\n'.join(recent)}\n\nNew message from {message.author.display_name}: {message.content[:300]}{mention_note}{reply_note}\n\nShould Maxwell reply?"},
             ]
             await self._acquire_ai_slot(timeout=30)
             try:
