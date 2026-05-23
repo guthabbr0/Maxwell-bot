@@ -101,6 +101,7 @@ def test_generate_chat_completion_falls_back_to_secondary_provider():
     provider.available = True
     session = FakeSequenceSession([
         FakeErrorResponse(503, "down"),
+        FakeErrorResponse(503, "down"),
         FakeResponse(),
     ])
     provider._session = session
@@ -112,10 +113,42 @@ def test_generate_chat_completion_falls_back_to_secondary_provider():
     asyncio.run(run())
     assert session.urls == [
         "http://primary.test/v1/chat/completions",
+        "http://primary.test/v1/chat/completions",
         "http://fallback.test/v1/chat/completions",
     ]
     assert session.payloads[0]["model"] == "primary-model"
-    assert session.payloads[1]["model"] == "fallback-model"
+    assert session.payloads[1]["model"] == "primary-model"
+    assert session.payloads[2]["model"] == "fallback-model"
     assert "max_tokens" not in session.payloads[0]
-    assert "max_tokens" not in session.payloads[1]
-    assert session.payloads[1]["reasoning"] == {"exclude": True}
+    assert "max_tokens" not in session.payloads[2]
+    assert session.payloads[2]["reasoning"] == {"exclude": True}
+
+
+def test_generate_chat_completion_retries_primary_before_fallback():
+    provider = OllamaProvider(
+        "http://primary.test/v1",
+        "primary-model",
+        10,
+        0.5,
+        fallback_base_url="http://fallback.test/v1",
+        fallback_model="fallback-model",
+        fallback_api_key="fallback-key",
+    )
+    provider.available = True
+    session = FakeSequenceSession([
+        FakeErrorResponse(503, "down"),
+        FakeResponse(),
+    ])
+    provider._session = session
+
+    async def run():
+        message = await provider.generate_chat_completion([{"role": "user", "content": "hi"}])
+        assert message["content"] == "ok"
+
+    asyncio.run(run())
+    assert session.urls == [
+        "http://primary.test/v1/chat/completions",
+        "http://primary.test/v1/chat/completions",
+    ]
+    assert session.payloads[0]["model"] == "primary-model"
+    assert session.payloads[1]["model"] == "primary-model"

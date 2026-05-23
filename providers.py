@@ -116,7 +116,11 @@ class OllamaProvider:
         return {"Authorization": f"Bearer {api_key}"}
 
     def _attempt_endpoint(self, attempt: int) -> ProviderEndpoint:
-        return self._endpoints[(attempt - 1) % len(self._endpoints)]
+        if len(self._endpoints) < 2:
+            return self._endpoints[0]
+        # Attempt 1 and 2: primary (main)
+        # Attempt 3 and beyond: fallback (second provider)
+        return self._endpoints[0] if attempt <= 2 else self._endpoints[1]
 
     def _should_wait_before_retry(self, current: ProviderEndpoint, next_endpoint: ProviderEndpoint) -> bool:
         return current.name == next_endpoint.name
