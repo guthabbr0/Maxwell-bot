@@ -60,6 +60,7 @@ See `.env.example` for a full template. Key variables:
 | Variable | Required | Description |
 |---|---|---|
 | `DISCORD_TOKEN` | Yes | Discord user token |
+| `TELEGRAM_TOKEN` | No | Telegram bot token for optional Telegram long-polling support |
 | `OLLAMA_BASE_URL` | No | OpenAI-compatible API base URL (default: `http://localhost:11434`) |
 | `OLLAMA_API_KEY` | No | Bearer token for the LLM API (falls back to `OPENAI_COMPAT_API_KEY`) |
 | `OLLAMA_MODEL` | No | Model name (default: `gemma4:31b-cloud`) |
