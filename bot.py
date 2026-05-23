@@ -134,14 +134,26 @@ def extract_json_object(text: str, start: int = 0) -> tuple[str, int] | None:
 
 
 def _tool_params_from_json(obj: dict) -> tuple[str | None, dict]:
-    name = obj.get("tool") or obj.get("name") or obj.get("action")
+    tool_name = obj.get("tool")
+    fallback_name = obj.get("name")
+    action_name = obj.get("action")
+    name = tool_name or fallback_name or action_name
     if not isinstance(name, str):
         return None, {}
     name = name.strip()
     params = obj.get("args") or obj.get("params")
     if isinstance(params, dict):
         return name, params
-    return name, {k: v for k, v in obj.items() if k not in {"tool", "name", "action"}}
+
+    selector_keys = set()
+    if isinstance(tool_name, str) and tool_name.strip():
+        selector_keys.add("tool")
+    elif isinstance(fallback_name, str) and fallback_name.strip():
+        selector_keys.add("name")
+    elif isinstance(action_name, str) and action_name.strip():
+        selector_keys.add("action")
+
+    return name, {k: v for k, v in obj.items() if k not in selector_keys}
 
 
 def collect_tool_calls(response: str, available_tools: set[str], disabled_tools: set[str] | None = None) -> list[tuple[int, int, str, dict]]:

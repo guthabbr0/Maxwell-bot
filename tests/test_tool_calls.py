@@ -32,3 +32,10 @@ def test_collect_tool_calls_ignores_disabled_tools():
     calls = collect_tool_calls('{"tool":"react","emoji":"catjam"}', TOOLS, {"react"})
 
     assert calls == []
+
+def test_collect_tool_calls_keeps_name_param_when_tool_key_selects_tool():
+    calls = collect_tool_calls('{"tool":"create_site","name":"nyxwell","title":"hi"}', TOOLS | {"create_site"})
+
+    assert [(name, params) for _start, _end, name, params in calls] == [
+        ("create_site", {"name": "nyxwell", "title": "hi"})
+    ]
