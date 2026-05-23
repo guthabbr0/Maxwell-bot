@@ -1100,8 +1100,57 @@ class NoResponseTool(Tool):
         return "__NO_RESPONSE__"
 
 
+class SendFileTool(Tool):
+    """Create and send an arbitrary file attachment"""
+
+    MAX_SIZE = 25 * 1024 * 1024
+
+    def get_description(self):
+        return (
+            "Create a file with any filename/extension and send it as an attachment. "
+            "Use this for .txt, .py, .json, .html, binary files, etc. "
+            "Params: filename (required), content (required), encoding (optional: text or base64; default text)."
+        )
+
+    async def execute(self, message: Message, filename: str = None, content: str = None, encoding: str = "text", **kwargs) -> str:
+        if not filename or not str(filename).strip():
+            return "Error: filename is required"
+        if content is None:
+            return "Error: content is required"
+
+        safe_name = Path(str(filename).strip()).name
+        if not safe_name or safe_name in {".", ".."}:
+            return "Error: invalid filename"
+
+        mode = str(encoding or "text").strip().lower()
+        try:
+            if mode in {"base64", "b64"}:
+                blob = base64.b64decode(str(content), validate=True)
+            elif mode in {"text", "utf8", "utf-8"}:
+                blob = str(content).encode("utf-8")
+            else:
+                return "Error: encoding must be text or base64"
+        except Exception as e:
+            return f"Error: could not decode file content: {e}"
+
+        if len(blob) > self.MAX_SIZE:
+            return f"Error: file is too large (max {self.MAX_SIZE // 1024 // 1024} MB)"
+
+        file = File(BytesIO(blob), filename=safe_name)
+        try:
+            await message.reply(file=file)
+        except discord.Forbidden:
+            return "Error: no permission to send files here"
+        except discord.HTTPException as e:
+            return f"Error sending file: {e}"
+        except Exception as e:
+            return f"Error sending file: {e}"
+
+        return f"__FILE_SENT__ Sent file: {safe_name} ({len(blob)} bytes)"
+
+
 class ShellTool(Tool):
-    """Execute commands in an isolated Docker container (OWNER ONLY)"""
+    """Execute shell commands on the host"""
 
     CONTAINER_NAME = "maxwell-shell"
     IMAGE_NAME = "maxwell-shell"
@@ -1109,30 +1158,18 @@ class ShellTool(Tool):
     MAX_OUTPUT = 8000
     TIMEOUT = 60
 
-    def __init__(self, bot):
-        super().__init__(bot)
-        self._container_ready = False
-
     def get_description(self):
         return (
-            "Run a shell command in a Docker container (OWNER ONLY). Has curl, python3, git, nmap, dig, jq, etc. "
-            "Container persists between calls. Output sent directly to chat. "
+            "Run a shell command directly on the host with bash -lc. Output sent directly to chat. "
             "Params: command (required)."
         )
 
     async def execute(self, message: Message, command: str = None, **kwargs) -> str:
-        if str(message.author.id) not in OWNER_IDS:
-            return "Error: shell is owner-only"
         if not command or not command.strip():
             return "Error: command is required"
 
-        ok = await self._ensure_container()
-        if not ok:
-            return "Error: could not start or connect to shell container"
-
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "exec", self.CONTAINER_NAME,
                 "bash", "-lc", command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1183,74 +1220,6 @@ class ShellTool(Tool):
                 await asyncio.sleep(0.3)
 
         return f"__SHELL_SENT__\n{text}"
-
-    async def _ensure_container(self):
-        if self._container_ready:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "docker", "exec", self.CONTAINER_NAME, "echo", "ready",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(proc.communicate(), timeout=5)
-                if proc.returncode == 0:
-                    return True
-            except Exception:
-                pass
-            self._container_ready = False
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "inspect", self.CONTAINER_NAME,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            if proc.returncode == 0:
-                proc = await asyncio.create_subprocess_exec(
-                    "docker", "rm", "-f", self.CONTAINER_NAME,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.communicate()
-        except Exception:
-            pass
-
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "build", "-t", self.IMAGE_NAME, self.DOCKERFILE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error(f"Docker build failed: {stderr.decode()[-500:]}")
-            return False
-
-        cmd = [
-            "docker", "run", "-d",
-            "--name", self.CONTAINER_NAME,
-            "--network", "none",
-            "--memory", "256m",
-            "--cpus", "0.5",
-            "--pids-limit", "128",
-            "--read-only",
-            "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges:true",
-            self.IMAGE_NAME,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error(f"Docker run failed: {stderr.decode()[-500:]}")
-            return False
-
-        self._container_ready = True
-        logger.info(f"Shell container '{self.CONTAINER_NAME}' started")
-        return True
 
 
 class FetchUrlTool(Tool):

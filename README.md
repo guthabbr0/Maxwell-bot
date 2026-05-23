@@ -8,7 +8,7 @@ Maxwell is a Discord self-bot backed by any OpenAI-compatible API. It reads text
 
 - Multimodal input: images, audio, video, text files, and Discord embeds are forwarded to the model with normalized video, extracted frames, and extracted audio.
 - Visual memory: recent images persist across messages per channel (configurable depth).
-- Tool system: image generation (Pollinations, NVIDIA NIM, GPT-compatible), web search, URL fetch, meme sending, shell execution (sandboxed Docker), polls, invites, site generation, avatar/presence/nickname changes, message editing/forwarding/deletion, and more.
+- Tool system: image generation (Pollinations, NVIDIA NIM, GPT-compatible), web search, URL fetch, arbitrary file sending, meme/media sending, shell execution, polls, invites, site generation, avatar/presence/nickname changes, message editing/forwarding/deletion, and more.
 - Auto mode: per-channel opt-in where Maxwell decides whether to respond to each message via a lightweight decider prompt.
 - Reaction handler: responds to emoji reactions on its own messages in auto-mode channels.
 - Per-server custom prompts, long-term memory, and scoped cross-context facts across DMs, servers, groups, and channels.
@@ -27,7 +27,7 @@ memory.py           Channel/server memory manager
 api/api_server.py   Dashboard and admin API server
 web/                Static dashboard files (index.html, admin/)
 examples/           Caddyfile and PM2 config examples
-docker/             Shell tool sandbox Dockerfile
+docker/             Legacy shell sandbox Dockerfile
 ecosystem.config.js PM2 process config
 ```
 
@@ -141,7 +141,7 @@ Static files (`web/index.html`, `web/admin/index.html`) should be copied to a we
 - Never commit `.env`, `data/`, logs, PM2 dumps, or generated sites.
 - Set real values for `MAXWELL_ADMIN_USER` and `MAXWELL_ADMIN_PASSWORD`. The API does not persist or bootstrap credentials.
 - Generated bot sites serve arbitrary HTML. Host them on a separate origin from admin pages to prevent credential theft via XSS.
-- The shell tool runs commands inside a sandboxed Docker container (no network, read-only filesystem, capped memory/CPU/PIDs). See `docker/` for the Dockerfile.
+- The shell tool runs commands directly with `bash -lc` from the bot process environment. Only enable tools where that level of host access is intended.
 
 ## License
 

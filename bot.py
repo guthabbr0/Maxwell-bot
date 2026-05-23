@@ -38,6 +38,7 @@ from bot_tools import (
     NoResponseTool,
     ReactTool,
     SearchMessagesTool,
+    SendFileTool,
     SendMediaTool,
     SendMemeTool,
     SetActivityTool,
@@ -336,14 +337,23 @@ class _NoopTyping:
         return False
 
 
+class TelegramUserAdapter:
+    def __init__(self, user_id, display_name: str = "Telegram User", bot: bool = False):
+        self.id = user_id
+        self.display_name = display_name
+        self.name = display_name
+        self.bot = bot
+
+
 class TelegramMessageAdapter:
-    def __init__(self, session, url_base: str, chat_id, message_id):
+    def __init__(self, session, url_base: str, chat_id, message_id, user_id=None, user_name: str = "Telegram User"):
         self.session = session
         self.url_base = url_base
         self.chat_id = chat_id
         self.id = message_id or chat_id
         self.guild = None
         self.channel = self
+        self.author = TelegramUserAdapter(user_id or chat_id, user_name)
 
     def typing(self):
         return _NoopTyping()
@@ -399,6 +409,14 @@ class TelegramMessageAdapter:
         if content:
             async with self.session.post(f"{self.url_base}/sendMessage", json={"chat_id": self.chat_id, "text": content}):
                 pass
+        return None
+
+    async def send(self, content: str = None, file=None, **kwargs):
+        return await self.reply(content=content, file=file, **kwargs)
+
+    async def send_voice_file(self, path: str):
+        with open(path, "rb") as fh:
+            await self._send_file_bytes(fh.read(), Path(path).name)
         return None
 
 
@@ -652,6 +670,7 @@ class MaxwellBot(commands.Bot):
         self.tools["no_response"] = NoResponseTool(self)
         self.tools["shell"] = ShellTool(self)
         self.tools["fetch_url"] = FetchUrlTool(self)
+        self.tools["send_file"] = SendFileTool(self)
         self.tools["send_meme"] = SendMemeTool(self)
         self.tools["send_media"] = SendMediaTool(self)
         self.tools["kilo_run"] = KiloTool(self)
@@ -2577,6 +2596,27 @@ class MaxwellBot(commands.Bot):
         cleaned = re.sub(r"\[/?(?:TOOL_CALL:)?[\w-]+.*?\]", "", "".join(segments)).strip()
         return cleaned, tool_results
 
+    def _tool_system_prompt(self) -> str:
+        if not self.tools or not self._control.get("tools_enabled", True):
+            return ""
+        disabled = set(self._control.get("disabled_tools", []) or [])
+        descriptions = [f"{name}: {tool.get_description()}" for name, tool in self.tools.items() if name not in disabled]
+        if not descriptions:
+            return ""
+        return (
+            "Tools are optional. Use them only when they actually help. Available tools: "
+            + " | ".join(descriptions)
+            + "\nTo call a tool, output one plain JSON object on its own line and nothing else for that tool call: "
+            + '{"tool":"tool_name","param":"value"}. '
+            + "Use exact tool names. Put parameters directly in the object, or under an args object. "
+            + "Examples: {\"tool\":\"react\",\"emoji\":\"catjam\"} or "
+            + "{\"tool\":\"send_file\",\"filename\":\"script.py\",\"content\":\"print('hi')\\n\"}. "
+            + "For create_site with full HTML, prefer this raw block so HTML quotes do not break JSON: "
+            + "[create_site]\nname: short-slug\ntitle: Site title\nbody:\n<!DOCTYPE html>...\n[/create_site]. "
+            + "After tool results are returned, answer normally. Do not wrap tool calls in markdown. "
+            + "IMPORTANT: The character limit does NOT apply to tool JSON calls. You may write as much as needed in tool parameters."
+        )
+
     async def _build_messages(self, message, user_message: str, has_media: bool = False, media_summary: str = "") -> list[dict]:
         channel_id = str(message.channel.id)
         system_parts = [
@@ -2642,23 +2682,9 @@ class MaxwellBot(commands.Bot):
                     + ". If you want to use one in chat, write exactly its :name: alias; Maxwell will render it. "
                     "Do not write raw Discord emoji IDs."
                 )
-        if self.tools and self._control.get("tools_enabled", True):
-            disabled = set(self._control.get("disabled_tools", []) or [])
-            descriptions = [f"{name}: {tool.get_description()}" for name, tool in self.tools.items() if name not in disabled]
-            if descriptions:
-                system_parts.append(
-                    "Tools are optional. Use them only when they actually help. Available tools: "
-                    + " | ".join(descriptions)
-                    + "\nTo call a tool, output one plain JSON object on its own line and nothing else for that tool call: "
-                    '{"tool":"tool_name","param":"value"}. '
-                    "Use exact tool names. Put parameters directly in the object, or under an args object. "
-                    "Examples: {\"tool\":\"react\",\"emoji\":\"catjam\"} or "
-                    "{\"tool\":\"web_search\",\"query\":\"latest thing\"}. "
-                    "For create_site with full HTML, prefer this raw block so HTML quotes do not break JSON: "
-                    "[create_site]\nname: short-slug\ntitle: Site title\nbody:\n<!DOCTYPE html>...\n[/create_site]. "
-                    "After tool results are returned, answer normally. Do not wrap tool calls in markdown. "
-                    "IMPORTANT: The character limit does NOT apply to tool JSON calls. You may write as much as needed in tool parameters."
-                )
+        tool_prompt = self._tool_system_prompt()
+        if tool_prompt:
+            system_parts.append(tool_prompt)
         if has_media:
             system_parts.append(
                 "Multimodal input: recent image attachments and current audio/video attachments are available in the message payload. "
@@ -2835,12 +2861,11 @@ class MaxwellBot(commands.Bot):
                         except Exception as e:
                             logger.warning(f"Telegram context fetching error: {e}")
 
-                    if self._control.get("tools_enabled", True) and "tts" in self.tools:
+                    tool_prompt = self._tool_system_prompt()
+                    if tool_prompt:
                         system_parts.append(
-                            "Telegram voice replies: when the user asks you to speak, say it out loud, or use TTS, "
-                            "call the tts tool with one plain JSON object and no extra text: "
-                            '{"tool":"tts","text":"words to speak"}. '
-                            "The bot will send it as a Telegram voice message."
+                            tool_prompt
+                            + " Telegram uses the same tool calls as Discord; file, media, shell, and TTS tools send back into this Telegram chat."
                         )
 
                     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
@@ -2884,7 +2909,7 @@ class MaxwellBot(commands.Bot):
                     response_text = response_text.strip()
 
                     if self._control.get("tools_enabled", True):
-                        tg_tool_message = TelegramMessageAdapter(session, url_base, chat_id, message.get("message_id"))
+                        tg_tool_message = TelegramMessageAdapter(session, url_base, chat_id, message.get("message_id"), user_id, user_name)
                         response_text, tool_results = await self._process_tool_calls(tg_tool_message, response_text)
                         if any("__NO_RESPONSE__" in tr for tr in tool_results):
                             response_text = ""
