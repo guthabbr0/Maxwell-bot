@@ -1720,21 +1720,32 @@ class MaxwellBot(commands.Bot):
     def _split_response(text: str, limit: int = 1900) -> list[str]:
         if len(text) <= limit:
             return [text]
-        chunks = []
+        base_chunks = []
         current = ""
         for part in re.split(r"(\n+)", text):
             if len(current) + len(part) <= limit:
                 current += part
             else:
                 if current.strip():
-                    chunks.append(current.strip())
+                    base_chunks.append(current.strip())
                 while len(part) > limit:
-                    chunks.append(part[:limit])
+                    base_chunks.append(part[:limit].strip())
                     part = part[limit:]
                 current = part
         if current.strip():
-            chunks.append(current.strip())
-        return chunks
+            base_chunks.append(current.strip())
+
+        fixed: list[str] = []
+        in_code_block = False
+        for chunk in base_chunks:
+            out = chunk
+            if in_code_block:
+                out = "```\n" + out
+            if out.count("```") % 2 == 1:
+                out = out.rstrip() + "\n```"
+                in_code_block = not in_code_block
+            fixed.append(out)
+        return fixed
 
     async def _extract_media(self, message) -> tuple[list[str], list[dict]]:
         if not self._control.get("process_images", True):
