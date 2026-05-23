@@ -9,6 +9,9 @@ class FakeTool:
         self.result = result
         self.calls = []
 
+    def get_description(self):
+        return "fake tool"
+
     async def execute(self, message, **params):
         self.calls.append(params)
         return self.result
@@ -75,6 +78,51 @@ def test_process_tool_calls_strips_disabled_tool_call():
         assert react.calls == []
 
     asyncio.run(run())
+
+
+def test_process_tool_calls_strips_platform_incompatible_tool_call():
+    react = FakeTool("Reacted")
+    bot = SimpleNamespace(
+        _control={"tools_enabled": True, "disabled_tools": [], "typing_indicator": False},
+        tools={"react": react},
+    )
+    message = SimpleNamespace(tool_platform="telegram")
+
+    async def run():
+        response, tool_results = await MaxwellBot._process_tool_calls(
+            bot,
+            message,
+            '{"tool":"react","emoji":"catjam"}',
+        )
+        assert response == ""
+        assert tool_results == ["Tool react: Error - tool is not available on this platform"]
+        assert react.calls == []
+
+    asyncio.run(run())
+
+
+def test_tool_prompt_filters_discord_only_tools_for_telegram():
+    bot = SimpleNamespace(
+        _control={"tools_enabled": True, "disabled_tools": []},
+        tools={"send_file": FakeTool("sent"), "react": FakeTool("Reacted")},
+    )
+
+    prompt = MaxwellBot._tool_system_prompt(bot, "telegram")
+
+    assert "send_file:" in prompt
+    assert "react:" not in prompt
+
+
+def test_tool_prompt_keeps_discord_tools_for_discord():
+    bot = SimpleNamespace(
+        _control={"tools_enabled": True, "disabled_tools": []},
+        tools={"send_file": FakeTool("sent"), "react": FakeTool("Reacted")},
+    )
+
+    prompt = MaxwellBot._tool_system_prompt(bot, "discord")
+
+    assert "send_file:" in prompt
+    assert "react:" in prompt
 
 
 def test_shell_tool_results_trigger_followup():

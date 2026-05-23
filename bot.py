@@ -354,6 +354,7 @@ class TelegramMessageAdapter:
         self.guild = None
         self.channel = self
         self.author = TelegramUserAdapter(user_id or chat_id, user_name)
+        self.tool_platform = "telegram"
 
     def typing(self):
         return _NoopTyping()
@@ -560,6 +561,12 @@ FOLLOWUP_TOOL_NAMES = {
     "image_generator", "hd_image", "lookup_user", "search_messages", "create_invite", "create_poll",
     "forward_message", "edit_message", "list_servers", "create_site", "list_sites", "web_search",
     "fetch_url", "shell",
+}
+
+TELEGRAM_COMPATIBLE_TOOL_NAMES = {
+    "image_generator", "hd_image", "memory_edit", "typing", "tts", "create_site", "list_sites",
+    "web_search", "no_response", "shell", "fetch_url", "send_file", "send_meme", "send_media",
+    "kilo_run",
 }
 
 
@@ -2567,6 +2574,7 @@ class MaxwellBot(commands.Bot):
         if not self._control.get("tools_enabled", True):
             return response, []
         disabled = set(self._control.get("disabled_tools", []) or [])
+        compatible = MaxwellBot._compatible_tool_names(self, MaxwellBot._message_tool_platform(self, message))
         calls = collect_tool_calls(response, set(self.tools), disabled, include_disabled=True)
         if not calls:
             return response, []
@@ -2582,6 +2590,9 @@ class MaxwellBot(commands.Bot):
                     if name in disabled:
                         tool_results.append(f"Tool {name}: Error - tool is disabled")
                         continue
+                    if name not in compatible:
+                        tool_results.append(f"Tool {name}: Error - tool is not available on this platform")
+                        continue
                     result = await self.tools[name].execute(message, **params)
                     tool_results.append(f"Tool {name}: {result}" if result else f"Tool {name}: executed successfully")
                 except Exception as e:
@@ -2596,11 +2607,24 @@ class MaxwellBot(commands.Bot):
         cleaned = re.sub(r"\[/?(?:TOOL_CALL:)?[\w-]+.*?\]", "", "".join(segments)).strip()
         return cleaned, tool_results
 
-    def _tool_system_prompt(self) -> str:
+    def _message_tool_platform(self, message) -> str:
+        return str(getattr(message, "tool_platform", "discord") or "discord")
+
+    def _compatible_tool_names(self, platform: str) -> set[str]:
+        if platform == "telegram":
+            return set(self.tools).intersection(TELEGRAM_COMPATIBLE_TOOL_NAMES)
+        return set(self.tools)
+
+    def _tool_system_prompt(self, platform: str = "discord") -> str:
         if not self.tools or not self._control.get("tools_enabled", True):
             return ""
         disabled = set(self._control.get("disabled_tools", []) or [])
-        descriptions = [f"{name}: {tool.get_description()}" for name, tool in self.tools.items() if name not in disabled]
+        compatible = MaxwellBot._compatible_tool_names(self, platform)
+        descriptions = [
+            f"{name}: {tool.get_description()}"
+            for name, tool in self.tools.items()
+            if name in compatible and name not in disabled
+        ]
         if not descriptions:
             return ""
         return (
@@ -2861,11 +2885,11 @@ class MaxwellBot(commands.Bot):
                         except Exception as e:
                             logger.warning(f"Telegram context fetching error: {e}")
 
-                    tool_prompt = self._tool_system_prompt()
+                    tool_prompt = self._tool_system_prompt("telegram")
                     if tool_prompt:
                         system_parts.append(
                             tool_prompt
-                            + " Telegram uses the same tool calls as Discord; file, media, shell, and TTS tools send back into this Telegram chat."
+                            + " Telegram uses the same tool-call format as Discord. The listed tools are the ones that can run in this Telegram chat."
                         )
 
                     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
