@@ -1534,15 +1534,19 @@ class TtsTool(Tool):
             )
             service = riva.client.SpeechSynthesisService(auth)
 
+            tts_voice_name = "Jason"
+            tts_language_code = "en-US"
+            tts_emotion = "Angry"
+
             # Use gRPC service synchronously (run in executor since it is synchronous gRPC)
             def run_riva():
                 return service.synthesize(
                     text=text,
-                    voice_name="Jason",
-                    language_code="en-US",
+                    voice_name=tts_voice_name,
+                    language_code=tts_language_code,
                     sample_rate_hz=44100,
                     encoding=AudioEncoding.LINEAR_PCM,
-                    custom_configuration={"emotion": "Angry"}
+                    custom_configuration={"emotion": tts_emotion}
                 )
 
             loop = asyncio.get_event_loop()
