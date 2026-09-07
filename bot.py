@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+from contextvars import ContextVar
 import hashlib
 import hmac
 import html
@@ -209,6 +210,7 @@ from concurrency_safety import (  # noqa: E402
 from message_pipeline import (  # noqa: E402
     InboundDedup,
     ReplyQueue,
+    RequestJournal,
     Watermarks,
 )
 from bot_tools import (  # noqa: E402 - voice_recv monkey patch must run before these imports
@@ -438,6 +440,12 @@ if _LOG_LEVEL <= logging.DEBUG:
         logging.getLogger(_noisy).setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+_current_inbound: ContextVar[Any] = ContextVar("current_inbound", default=None)
+_current_inbound_effects: ContextVar[Any] = ContextVar(
+    "current_inbound_effects", default=None
+)
+_REQUEST_TERMINAL = frozenset({"delivered", "suppressed", "failed", "superseded"})
 
 # How long an out-of-band `,confirm` authorizes one destructive tool call on a
 # tainted turn. Short + one-shot so a fetched page can't ride a stale confirm.
@@ -2533,7 +2541,10 @@ def _tool_results_need_followup(tool_results: list[str]) -> bool:
     for result in tool_results:
         # Check for error prefixes, not just the substring "Error" anywhere
         # (prevents false positives like "Error handling in Python" search results)
-        if result.startswith(("Error:", "Error ")) or "\nError:" in result:
+        if (
+            result.startswith(("Error:", "Error ", "Tool no_response: Error:"))
+            or "\nError:" in result
+        ):
             return True
         if any(result.startswith(f"Tool {name}:") for name in FOLLOWUP_TOOL_NAMES):
             has_followup_signal = True
@@ -2829,6 +2840,12 @@ class MaxwellBot(commands.Bot):
             if getattr(self.config, "DATA_DIR", "")
             else "data/watermarks.json"
         )
+        self._request_journal = RequestJournal(
+            os.path.join(_jobs_data_dir, "inbound_requests.sqlite3")
+        )
+        self._inbound_processing: set[str] = set()
+        self._recovery_cursors: dict[str, int] = {}
+        self._recovery_lock = asyncio.Lock()
         self._telegram_chat_locks: dict[str, asyncio.Lock] = {}
         # Channels the bot is currently generating a reply for (in-flight).
         # Autonomy reads this to avoid posting into a channel mid-reply, which
@@ -3307,7 +3324,21 @@ class MaxwellBot(commands.Bot):
         """Generate through the main provider, preferring fallback at night."""
         for key, value in self._night_fallback_kwargs().items():
             kwargs.setdefault(key, value)
-        return await self.ai_provider.generate_response(messages, **kwargs)
+        message = _current_inbound.get()
+        if message is not None:
+            kwargs.setdefault("request_id", str(getattr(message, "id", "") or ""))
+        started = time.monotonic()
+        try:
+            return await self.ai_provider.generate_response(messages, **kwargs)
+        finally:
+            if message is not None:
+                logger.info(
+                    "inbound mid=%s cid=%s stage=provider duration_ms=%d requested_model=%s",
+                    getattr(message, "id", ""),
+                    getattr(getattr(message, "channel", None), "id", ""),
+                    (time.monotonic() - started) * 1000,
+                    kwargs.get("model") or getattr(self.ai_provider, "model", ""),
+                )
 
     async def _get_autonomy_provider(self):
         """Return a provider for the autonomy loop.
@@ -4011,6 +4042,284 @@ class MaxwellBot(commands.Bot):
             stats = {}
             self._reply_drop_counts = stats
         stats[why] = int(stats.get(why, 0) or 0) + 1
+        status = {"deferred": "deferred", "channel cleared": "superseded"}.get(
+            why, "suppressed"
+        )
+        MaxwellBot._record_request_outcome(self, entry.message, status, f"queue_{why}")
+
+    def _request_state(self, message) -> dict:
+        journal = getattr(self, "_request_journal", None)
+        mid = str(getattr(message, "id", "") or "")
+        return (journal.get(mid) or {}) if journal is not None and mid else {}
+
+    def _record_request_outcome(self, message, status: str, reason: str = "") -> None:
+        journal = getattr(self, "_request_journal", None)
+        row = MaxwellBot._request_state(self, message)
+        if not row:
+            return
+        if row["status"] in _REQUEST_TERMINAL and not (
+            row["status"] == status == "delivered" and reason == "partial_delivery"
+        ):
+            return
+        journal.update(row["message_id"], status, reason=reason)
+        logger.info(
+            "inbound mid=%s cid=%s stage=%s reason=%s attempts=%s effects=%s",
+            row["message_id"],
+            row["channel_id"],
+            status,
+            reason,
+            row["attempts"],
+            row["effects_started"],
+        )
+
+    def _mark_request_effect(self, message) -> None:
+        """Checkpoint before an irreversible operation; HTTP is not exactly-once."""
+        row = MaxwellBot._request_state(self, message)
+        if row and row["status"] == "superseded":
+            raise asyncio.CancelledError
+        if row and not row["effects_started"]:
+            self._request_journal.update(
+                row["message_id"], row["status"], effects_started=True
+            )
+            logger.info(
+                "inbound mid=%s cid=%s stage=effect_started",
+                row["message_id"],
+                row["channel_id"],
+            )
+
+    def _record_delivery(self, message, sent) -> None:
+        if sent is None or not getattr(sent, "id", None):
+            return
+        row = MaxwellBot._request_state(self, message)
+        if row and row["status"] not in _REQUEST_TERMINAL:
+            self._request_journal.update(
+                row["message_id"],
+                "delivered",
+                effects_started=True,
+                response_id=str(sent.id),
+            )
+            logger.info(
+                "inbound mid=%s cid=%s stage=delivered response_id=%s",
+                row["message_id"],
+                row["channel_id"],
+                sent.id,
+            )
+
+    def _inbound_setting(
+        self, key: str, default: float, low: float, high: float
+    ) -> float:
+        try:
+            value = float((getattr(self, "_control", None) or {}).get(key, default))
+            return max(low, min(value, high)) if math.isfinite(value) else default
+        except (TypeError, ValueError):
+            return default
+
+    async def _invoke_request_tool(self, message, name: str, tool, **params):
+        """Track live completion separately from the durable no-replay checkpoint."""
+        if name not in {"no_response", "more_tools", "reasoning"}:
+            MaxwellBot._mark_request_effect(self, message)
+        state = _current_inbound_effects.get()
+        if state and state["message_id"] != str(getattr(message, "id", "") or ""):
+            state = None
+        if state is not None:
+            state["tools_running"] += 1
+            if name not in RESULT_TOOL_NAMES and name not in {
+                "no_response", "more_tools", "reasoning"
+            }:
+                state["uncertain"] = True
+            # Legacy tools can send directly, without the slowmode wrapper.
+            if name in {
+                "image_generator", "hd_image", "create_poll", "join_server",
+                "guide", "send_message", "send_file", "shell", "send_meme",
+                "send_media", "tts", "forward_message",
+            }:
+                state["send_attempted"] = True
+        try:
+            result = await tool.execute(message, **params)
+            if state is not None:
+                if str(result or "").lstrip().lower().startswith(
+                    ("error", "could not", "failed", "refused")
+                ):
+                    state["uncertain"] = True
+                else:
+                    state["tools_completed"] += 1
+            return result
+        except BaseException:
+            if state is not None:
+                state["uncertain"] = True
+            raise
+        finally:
+            if state is not None:
+                state["tools_running"] -= 1
+
+    async def _request_failure(
+        self, message, reason: str, *, retryable=False, normal_completion=False
+    ) -> None:
+        row = self._request_state(message)
+        if not row or row["status"] in _REQUEST_TERMINAL:
+            return
+        attempts = int(self._inbound_setting("inbound_retry_attempts", 2, 1, 5))
+        if retryable and not row["effects_started"] and row["attempts"] < attempts:
+            self._record_request_outcome(message, "deferred", reason)
+            return
+        # A tool/send may have succeeded before its confirmation was lost.
+        # Never automatically repeat the operation, including after restart.
+        state = _current_inbound_effects.get()
+        completed_without_send = (
+            normal_completion
+            and state is not None
+            and state["message_id"] == str(getattr(message, "id", "") or "")
+            and state["tools_completed"] > 0
+            and state["tools_running"] == 0
+            and not state["send_attempted"]
+            and not state["uncertain"]
+        )
+        if row["effects_started"] and not completed_without_send:
+            reason = f"uncertain_after_effect:{reason}"
+        elif row["directed"] and self._control.get("error_replies", True):
+            try:
+                self._mark_request_effect(message)
+                sent = await asyncio.wait_for(
+                    self._send_with_slowmode(
+                        message.channel,
+                        (
+                            "I couldn't produce a final reply after using tools. "
+                            "I won't repeat those actions automatically."
+                            if row["effects_started"]
+                            else "I couldn't finish that request. Please try again."
+                        ),
+                        reply_to=message,
+                    ),
+                    timeout=10,
+                )
+                self._record_delivery(message, sent)
+                if self._request_state(message).get("status") == "delivered":
+                    return
+            except Exception as exc:
+                reason = f"fallback_failed:{type(exc).__name__}"
+        self._record_request_outcome(message, "failed", reason)
+
+    async def _run_reliable_turn(self, message, content: str | None = None):
+        """Own the entire turn, including preparation, cancellation and cleanup."""
+        journal = getattr(self, "_request_journal", None)
+        row = self._request_state(message)
+        if row and row["status"] in _REQUEST_TERMINAL:
+            return
+        if row and row["effects_started"]:
+            self._record_request_outcome(message, "failed", "interrupted_after_effect")
+            return
+        if row and row["attempts"] >= int(
+            self._inbound_setting("inbound_retry_attempts", 2, 1, 5)
+        ):
+            await self._request_failure(message, "retry_budget_exhausted")
+            return
+        if journal is not None and row:
+            journal.begin(row["message_id"])
+        token = _current_inbound.set(message)
+        effects_token = _current_inbound_effects.set({
+            "message_id": str(getattr(message, "id", "") or ""),
+            "tools_running": 0,
+            "tools_completed": 0,
+            "send_attempted": False,
+            "uncertain": False,
+        })
+        cid = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        current = asyncio.current_task()
+        self._active_requests[cid] = current
+        self._active_request_user[cid] = str(getattr(message.author, "id", ""))
+        active_messages = getattr(self, "_active_request_messages", None)
+        if active_messages is None:
+            active_messages = self._active_request_messages = {}
+        active_messages[cid] = message
+        started = time.monotonic()
+        try:
+            timeout = self._inbound_setting("live_turn_timeout_seconds", 180, 1, 7200)
+            async with asyncio.timeout(timeout):
+                if row:
+                    reason = self._queued_request_policy_reason(message)
+                    if reason:
+                        self._record_request_outcome(message, "suppressed", reason)
+                        return
+                await self._handle_message(message, content)
+            row = self._request_state(message)
+            if row and row["status"] not in _REQUEST_TERMINAL:
+                await self._request_failure(
+                    message, "no_visible_output", retryable=True, normal_completion=True
+                )
+        except asyncio.CancelledError:
+            row = self._request_state(message)
+            self._record_request_outcome(
+                message,
+                "failed" if row.get("effects_started") else "deferred",
+                "cancelled_after_effect" if row.get("effects_started") else "cancelled",
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "inbound mid=%s cid=%s stage=turn_error error=%s",
+                getattr(message, "id", ""),
+                cid,
+                type(exc).__name__,
+            )
+            await self._request_failure(
+                message,
+                type(exc).__name__,
+                retryable=isinstance(
+                    exc, (TimeoutError, ConnectionError, aiohttp.ClientError)
+                ),
+            )
+        finally:
+            # _handle_message's historic inner finally starts after preparation.
+            # This outer cleanup also covers failures before that point.
+            state = (getattr(self, "_inflight_context", None) or {}).get(
+                str(getattr(message, "id", "") or "")
+            )
+            if state:
+                self._end_inflight_context(state)
+                await self._exit_live_typing(state.get("live_typing"))
+            if self._active_requests.get(cid) is current:
+                self._active_requests.pop(cid, None)
+                self._active_request_user.pop(cid, None)
+            self._replying_channels.discard(cid)
+            if active_messages.get(cid) is message:
+                active_messages.pop(cid, None)
+            _current_inbound.reset(token)
+            _current_inbound_effects.reset(effects_token)
+            logger.info(
+                "inbound mid=%s cid=%s stage=turn_finished duration_ms=%d",
+                getattr(message, "id", ""),
+                cid,
+                (time.monotonic() - started) * 1000,
+            )
+
+    def _queued_request_policy_reason(self, message) -> str:
+        """Policy can change while an accepted request waits in the queue."""
+        control = self._control
+        cid = str(message.channel.id)
+        if not control.get("bot_enabled", True):
+            return "bot_disabled"
+        author = message.author
+        if (
+            str(author.id) in (getattr(self, "_blacklist", None) or set())
+            or str(author.id) in set(control.get("ignore_users", []) or [])
+        ) and not self._is_admin(author.id):
+            return "ignored_author"
+        if cid in set(control.get("blocked_channels", []) or []):
+            return "blocked_channel"
+        allowed = set(control.get("allowed_channels", []) or [])
+        if allowed and cid not in allowed:
+            return "channel_not_allowed"
+        if self._solo_blocks(message):
+            return "solo_restriction"
+        if isinstance(message.channel, discord.DMChannel):
+            if not control.get("reply_dms", True):
+                return "dm_replies_disabled"
+        elif isinstance(message.channel, discord.GroupChannel):
+            if not control.get("reply_groups", True):
+                return "group_replies_disabled"
+        elif message.guild and not control.get("reply_mentions", True):
+            return "mention_replies_disabled"
+        return ""
 
     def _dispatch_reply(self, message, content: str, *, directed: bool) -> str:
         """Hand a message to the per-channel reply queue.
@@ -4021,7 +4330,24 @@ class MaxwellBot(commands.Bot):
         """
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         if not channel_id:
+            MaxwellBot._record_request_outcome(
+                self, message, "failed", "missing_channel"
+            )
             return "dropped"
+        journal = getattr(self, "_request_journal", None)
+        if journal is not None:
+            journal.accept(
+                message.id,
+                channel_id,
+                getattr(message.author, "id", ""),
+                directed=directed,
+            )
+            row = MaxwellBot._request_state(self, message)
+            if row.get("status") in _REQUEST_TERMINAL:
+                return "duplicate"
+            if self._reply_queue.contains(channel_id, message.id):
+                return "duplicate"
+            journal.update(message.id, "queued", directed=directed)
         burst: list[Any] = []
         with contextlib.suppress(Exception):
             burst = list(getattr(message, "_watch_burst", None) or [])
@@ -4032,6 +4358,13 @@ class MaxwellBot(commands.Bot):
             directed=directed,
             burst=burst,
         )
+        if outcome in {"deferred", "dropped"}:
+            MaxwellBot._record_request_outcome(
+                self,
+                message,
+                "deferred" if directed else "suppressed",
+                f"queue_{outcome}",
+            )
         if outcome == "queued":
             logger.info(
                 "Reply queued for %s behind %d turn(s) in %s",
@@ -4042,25 +4375,8 @@ class MaxwellBot(commands.Bot):
         return outcome
 
     def _should_interrupt_inflight(self, message) -> bool:
-        """Cancel the in-flight turn only when THIS user hard-pings again.
-
-        Watch chatter used to match `_should_live_reply` and cancel image
-        generation / long tools mid-run.
-        """
-        if getattr(getattr(message, "author", None), "bot", False):
-            return False
-        if self.user is None:
-            return False
-        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
-        active = (getattr(self, "_active_requests", None) or {}).get(channel_id)
-        if active is None or active.done() or active is asyncio.current_task():
-            return False
-        active_user = (getattr(self, "_active_request_user", None) or {}).get(
-            channel_id
-        )
-        if active_user != str(getattr(message.author, "id", "") or ""):
-            return False
-        return self._directly_addressed(message)
+        """New pings are independent requests; only explicit ,stop cancels."""
+        return False
 
     def _get_telegram_chat_lock(self, chat_id) -> asyncio.Lock:
         key = str(chat_id)
@@ -4931,6 +5247,10 @@ class MaxwellBot(commands.Bot):
             str(channel_id or ""), None
         )
         task = (bucket or {}).get("task")
+        if bucket:
+            MaxwellBot._record_request_outcome(
+                self, bucket.get("latest_directed"), "superseded", "watch_cancelled"
+            )
         if task is not None and not task.done():
             task.cancel()
 
@@ -4969,8 +5289,16 @@ class MaxwellBot(commands.Bot):
             burst = burst[-24:]
         bucket["burst"] = burst
         if directed:
+            previous = bucket.get("latest_directed")
+            if previous is not message:
+                MaxwellBot._record_request_outcome(
+                    self, previous, "superseded", "watch_coalesced"
+                )
             bucket["latest_directed"] = message
             bucket["content"] = content
+            MaxwellBot._record_request_outcome(
+                self, message, "queued", "watch_debounce"
+            )
         old = bucket.get("task")
         if old is not None and not old.done():
             old.cancel()
@@ -5013,6 +5341,9 @@ class MaxwellBot(commands.Bot):
         content = getattr(target, "content", "") or bucket.get("content") or ""
         directed = self._directly_addressed(target)
         if not directed and not MaxwellBot._conversation_watch_enabled(self):
+            MaxwellBot._record_request_outcome(
+                self, target, "suppressed", "watch_disabled"
+            )
             return
         # Busy is re-checked here, not just when the line arrived: an image
         # generation or a long tool call can start during the debounce wait,
@@ -5022,6 +5353,9 @@ class MaxwellBot(commands.Bot):
         if not directed:
             busy = self._busy_reason(channel_id)
             if busy:
+                MaxwellBot._record_request_outcome(
+                    self, target, "suppressed", "watch_busy"
+                )
                 logger.info(
                     "Watch debounce: dropping soft follow-up in %s (%s)",
                     channel_id,
@@ -5112,8 +5446,10 @@ class MaxwellBot(commands.Bot):
         # The reply queue is the single serialization point for generating a
         # reply. Bound here (not at construction) because it needs the running
         # loop's task factory for tracking.
-        self._reply_queue.bind(self._handle_message, task_factory=self._track_task)
+        self._reply_queue.bind(self._run_reliable_turn, task_factory=self._track_task)
+        self._request_journal.recover()
         self._watermarks.load()
+        self._capture_recovery_snapshot()
         logger.info(
             "Reply queue bound; %d channel watermark(s) restored",
             len(self._watermarks),
@@ -5131,6 +5467,7 @@ class MaxwellBot(commands.Bot):
             asyncio.create_task(self._discord_state_loop()),
             asyncio.create_task(self._rem_scheduler_loop()),
             asyncio.create_task(self._watermark_save_loop(), name="watermark-save"),
+            asyncio.create_task(self._inbound_retry_loop(), name="inbound-retry"),
         ]
         if self.mail_poller is not None and self.mail_poller.configured():
             self._tasks.append(
@@ -5192,16 +5529,13 @@ class MaxwellBot(commands.Bot):
             return False
 
     async def on_disconnect(self):
+        self._capture_recovery_snapshot()
         logger.warning("discord gateway disconnected")
         self._gateway_last_disconnect = time.monotonic()
 
     async def on_resumed(self):
-        """A resume means the gateway believes it replayed — it often has not.
-
-        discord.py does not surface a gap, so a session that resumes after a
-        network blip silently loses every MESSAGE_CREATE from the outage. The
-        watermark makes that recoverable.
-        """
+        """Reconcile tracked history after resume without assuming replay failed."""
+        self._capture_recovery_snapshot()
         logger.info("discord gateway resumed; checking for missed messages")
         self._gateway_last_disconnect = None
         self._gateway_last_ok = time.monotonic()
@@ -5209,6 +5543,7 @@ class MaxwellBot(commands.Bot):
         self._dispatch_plugin_event("on_ready")
 
     async def on_ready(self):
+        self._capture_recovery_snapshot()
         self._gateway_last_ok = time.monotonic()
         self._gateway_last_disconnect = None
         if self.user:
@@ -5234,8 +5569,8 @@ class MaxwellBot(commands.Bot):
             current = getattr(self, "status", None)
             if current is not None:
                 self._current_status = current
-        # on_ready fires on every reconnect, which is exactly when a gateway
-        # gap has just happened. Recover the messages Discord never delivered.
+        # A fresh ready event can follow a restart or non-resumable session.
+        # Reconcile history to find any messages missing from durable receipt.
         self._spawn_detached(self._recover_missed_messages())
         self._dispatch_plugin_event("on_ready")
 
@@ -5259,12 +5594,7 @@ class MaxwellBot(commands.Bot):
         task.add_done_callback(_on_done)
 
     def _missed_message_scan_limit(self) -> int:
-        """How many messages per room a gap recovery is allowed to replay.
-
-        Bounded deliberately: a long outage in a busy room should produce a
-        few recent answers, not a wall of replies to a conversation that has
-        already moved on.
-        """
+        """Per-room page size; unfinished pages continue on the next tick."""
         raw = (getattr(self, "_control", None) or {}).get(
             "gap_recovery_max_messages", 20
         )
@@ -5273,67 +5603,221 @@ class MaxwellBot(commands.Bot):
         except (TypeError, ValueError):
             return 20
 
-    async def _recover_missed_messages(self) -> None:
-        """Replay messages the gateway never delivered, oldest first.
+    def _capture_recovery_snapshot(self) -> None:
+        cursors = getattr(self, "_recovery_cursors", None)
+        if cursors is None:
+            cursors = self._recovery_cursors = {}
+        for cid, mid in self._watermarks.channels():
+            cursors[cid] = min(cursors.get(cid, mid), mid)
+        self._load_failed_receipt_floors()
+        for cid, mid in self._failed_receipt_floors.items():
+            cursors[cid] = min(cursors.get(cid, mid), mid)
 
-        Every recovered message goes back through ``on_message``, so it gets
-        the same dedup, gating, memory write, and reply-queue treatment as a
-        live one. Dedup is what makes this safe to run on every reconnect: a
-        message the gateway *did* deliver is already recorded and is skipped.
-        """
+    def _load_failed_receipt_floors(self) -> None:
+        if hasattr(self, "_failed_receipt_floors"):
+            return
+        path = Path(self._watermarks.path).with_name("inbound_recovery_floors.json")
+        try:
+            floors = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            floors = {}
+        if not isinstance(floors, dict) or any(
+            not str(cid).isdigit() or not isinstance(mid, int) or mid < 0
+            for cid, mid in floors.items()
+        ):
+            raise ValueError("Invalid inbound recovery floors")
+        self._failed_receipt_floors = floors
+
+    def _save_failed_receipt_floors(self) -> None:
+        _atomic_json_write_sync(
+            Path(self._watermarks.path).with_name("inbound_recovery_floors.json"),
+            self._failed_receipt_floors,
+        )
+
+    def _freeze_failed_receipt(self, channel_id: str, message_id: str) -> None:
+        """Persist the gap even if the receipt itself could not be journaled."""
+        if not channel_id.isdigit() or not message_id.isdigit():
+            return
+        self._load_failed_receipt_floors()
+        floor = max(0, int(message_id) - 1)
+        prior = self._watermarks.get(channel_id)
+        if prior is not None:
+            floor = min(floor, prior)
+        floors = self._failed_receipt_floors
+        floors[channel_id] = min(floors.get(channel_id, floor), floor)
+        cursors = getattr(self, "_recovery_cursors", None)
+        if cursors is None:
+            cursors = self._recovery_cursors = {}
+        cursors[channel_id] = min(cursors.get(channel_id, floor), floors[channel_id])
+        versions = getattr(self, "_receipt_failure_versions", None)
+        if versions is None:
+            versions = self._receipt_failure_versions = {}
+        versions[channel_id] = versions.get(channel_id, 0) + 1
+        self._save_failed_receipt_floors()
+
+    async def _fetch_inbound_channel(self, channel_id):
+        channel = self.get_channel(int(channel_id))
+        if channel is None:
+            channel = await self.fetch_channel(int(channel_id))
+        return channel
+
+    async def _recover_missed_messages(self, *, settle=True) -> None:
+        """Serialize oldest-first pages, freezing each cursor until durable receipt."""
+        if not hasattr(self, "_recovery_lock"):
+            self._recovery_lock = asyncio.Lock()
+        if self._recovery_lock.locked():
+            return
+        failure_versions = getattr(self, "_receipt_failure_versions", None)
+        if failure_versions is None:
+            failure_versions = self._receipt_failure_versions = {}
+        if not hasattr(self, "_recovery_cursors"):
+            self._capture_recovery_snapshot()
         limit = self._missed_message_scan_limit()
         if limit <= 0:
             return
-        # Let the cache settle before hitting the API on a fresh connect.
-        await asyncio.sleep(2.0)
-        recovered = 0
-        scanned_rooms = 0
-        for channel_id, last_seen in self._watermarks.channels()[:40]:
-            channel: Any = (
-                self.get_channel(int(channel_id)) if channel_id.isdigit() else None
-            )
-            history = getattr(channel, "history", None)
-            if channel is None or not callable(history):
-                continue
-            scanned_rooms += 1
-            missed: list[Any] = []
-            try:
-                after = discord.Object(id=int(last_seen))
-                async for old in channel.history(
-                    limit=limit, after=after, oldest_first=False
-                ):
-                    if int(getattr(old, "id", 0) or 0) <= int(last_seen):
-                        continue
-                    missed.append(old)
-            except discord.Forbidden:
-                continue
-            except Exception as exc:
-                logger.debug("Gap scan failed for %s: %s", channel_id, exc)
-                continue
-            if not missed:
-                continue
-            missed.reverse()  # oldest first, so the room reads in order
-            logger.info(
-                "Gap recovery: replaying %d missed message(s) in %s",
-                len(missed),
-                channel_id,
-            )
-            for old in missed:
-                recovered += 1
+        async with self._recovery_lock:
+            if settle:
+                await asyncio.sleep(2.0)
+            # Eight pages per tick, rotating unfinished rooms to the back.
+            # A long backlog or inaccessible room cannot starve other rooms.
+            for channel_id, last_seen in list(self._recovery_cursors.items())[:8]:
+                if not channel_id.isdigit():
+                    self._recovery_cursors.pop(channel_id, None)
+                    continue
+                count = 0
+                failure_version = failure_versions.get(channel_id, 0)
                 try:
-                    await self.on_message(old)
+                    async with asyncio.timeout(30):
+                        channel = await self._fetch_inbound_channel(channel_id)
+                        async for old in channel.history(
+                            limit=limit,
+                            after=discord.Object(id=int(last_seen)),
+                            oldest_first=True,
+                        ):
+                            if int(getattr(old, "id", 0) or 0) <= int(last_seen):
+                                continue
+                            await self.on_message(old)
+                            journal = getattr(self, "_request_journal", None)
+                            if journal is not None and not journal.get(old.id):
+                                # The durable insert failed. Do not advance past it.
+                                break
+                            if failure_versions.get(channel_id, 0) != failure_version:
+                                break
+                            self._recovery_cursors[channel_id] = int(old.id)
+                            self._watermarks.note(channel_id, old.id)
+                            count += 1
+                        else:
+                            if (
+                                count < limit
+                                and failure_versions.get(channel_id, 0) == failure_version
+                            ):
+                                self._recovery_cursors.pop(channel_id, None)
+                                floors = (
+                                    getattr(self, "_failed_receipt_floors", None) or {}
+                                )
+                                if channel_id in floors:
+                                    floors.pop(channel_id)
+                                    self._save_failed_receipt_floors()
+                except (discord.Forbidden, discord.NotFound):
+                    # Retain the frozen cursor in case access is restored.
+                    continue
                 except Exception as exc:
                     logger.warning(
-                        "Gap replay failed for %s: %s", getattr(old, "id", "?"), exc
+                        "inbound cid=%s stage=recovery_error error=%s",
+                        channel_id,
+                        type(exc).__name__,
                     )
-        if recovered:
-            logger.info(
-                "Gap recovery replayed %d message(s) across %d room(s)",
-                recovered,
-                scanned_rooms,
-            )
-        with contextlib.suppress(Exception):
+                finally:
+                    if channel_id in self._recovery_cursors:
+                        cursor = self._recovery_cursors.pop(channel_id)
+                        self._recovery_cursors[channel_id] = cursor
             self._watermarks.save()
+
+    async def _retry_pending_inbound(self) -> None:
+        journal = getattr(self, "_request_journal", None)
+        if journal is None:
+            return
+        delay = self._inbound_setting("inbound_retry_delay_seconds", 5, 1, 300)
+        if getattr(self, "_inbound_retry_before", None) is None:
+            self._inbound_retry_before = time.time()
+            self._inbound_retry_after = None
+        rows = journal.pending(
+            limit=1000,
+            after=self._inbound_retry_after,
+            before=self._inbound_retry_before,
+        )
+        handled = 0
+        for row in rows:
+            if handled >= 20:
+                break
+            mid, cid = row["message_id"], row["channel_id"]
+            self._inbound_retry_after = (row["created_at"], mid)
+            if self._reply_queue.contains(cid, mid) or mid in self._inbound_processing:
+                continue
+            if self._reply_queue.depth(cid) >= self._reply_queue.max_directed:
+                continue
+            if time.time() - float(row["updated_at"]) < delay * max(1, row["attempts"]):
+                continue
+            handled += 1
+            message = SimpleNamespace(id=mid, channel=SimpleNamespace(id=cid))
+            try:
+                channel = await asyncio.wait_for(
+                    self._fetch_inbound_channel(cid), timeout=10
+                )
+                message = await asyncio.wait_for(
+                    channel.fetch_message(int(mid)), timeout=10
+                )
+                # Admissions run the normal policy gates but not receipt dedup.
+                await self.on_message(message)
+            except Exception as exc:
+                await self._pending_fetch_failed(row, message, exc)
+        else:
+            if len(rows) < 1000:
+                # Finish a fixed receipt-time snapshot before including new
+                # arrivals; sustained traffic cannot extend a sweep forever.
+                self._inbound_retry_before = None
+                self._inbound_retry_after = None
+
+    async def _pending_fetch_failed(self, receipt, message, exc) -> None:
+        mid, cid = receipt["message_id"], receipt["channel_id"]
+        if self._reply_queue.contains(cid, mid) or mid in self._inbound_processing:
+            return
+        current = self._request_journal.get(mid)
+        if (
+            not current
+            or current["status"] in _REQUEST_TERMINAL
+            or current["effects_started"]
+            or current["updated_at"] != receipt["updated_at"]
+        ):
+            return
+        # The HTTP fetch can race a fresh gateway admission. Claim only after
+        # rechecking its receipt, then retain ownership through error delivery.
+        self._inbound_processing.add(mid)
+        try:
+            if isinstance(exc, (discord.Forbidden, discord.NotFound)):
+                self._record_request_outcome(message, "failed", type(exc).__name__)
+            else:
+                self._request_journal.begin(mid)
+                await self._request_failure(
+                    message, f"fetch:{type(exc).__name__}", retryable=True
+                )
+        finally:
+            self._inbound_processing.discard(mid)
+
+    async def _inbound_retry_loop(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(5)
+            try:
+                await self._retry_pending_inbound()
+                if self._recovery_cursors:
+                    await self._recover_missed_messages(settle=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "inbound stage=retry_loop_error error=%s", type(exc).__name__
+                )
 
     async def _discord_state_loop(self):
         while True:
@@ -6253,7 +6737,7 @@ class MaxwellBot(commands.Bot):
         return True
 
     async def on_message_edit(self, before, after):
-        """Keep transcript/visual context current without answering the edit."""
+        """Refresh context; only newly added direct mentions can start a turn."""
         self._dispatch_plugin_event("on_message_edit", before, after)
         try:
             loader = getattr(self, "_load_control", None)
@@ -6261,6 +6745,7 @@ class MaxwellBot(commands.Bot):
                 with contextlib.suppress(Exception):
                     loader()
             await self._refresh_edited_message(after, before=before)
+            await self._maybe_reply_to_edited_mention(before, after)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6275,11 +6760,41 @@ class MaxwellBot(commands.Bot):
                     loader()
             message = await self._message_from_raw_update(payload)
             if message is not None:
+                before = getattr(payload, "cached_message", None) or (
+                    getattr(self, "_message_snapshots", None) or {}
+                ).get(str(getattr(message, "id", "")))
                 await self._refresh_edited_message(message)
+                if "content" in (getattr(payload, "data", None) or {}):
+                    await self._maybe_reply_to_edited_mention(before, message)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("Failed to process raw Discord message edit", exc_info=True)
+
+    async def _maybe_reply_to_edited_mention(self, before, after):
+        if not self._control.get("respond_to_edited_mentions", True):
+            return
+        journal = getattr(self, "_request_journal", None)
+        if journal is None or self.user is None:
+            return
+        if self.user not in (getattr(after, "mentions", None) or []):
+            return
+        if before is not None and (
+            self.user in (getattr(before, "mentions", None) or [])
+            or getattr(before, "content", "") == getattr(after, "content", "")
+        ):
+            return
+        row = self._request_state(after)
+        if row and (
+            row["status"] != "suppressed"
+            or row["directed"]
+            or row["effects_started"]
+            or row["reason"] not in {"not_addressed", "cooldown", "empty_payload"}
+        ):
+            return
+        if row:
+            journal.update(after.id, "received", directed=True, reason="edited_mention")
+        await self.on_message(after)
 
     async def on_message(self, message):
         """Error boundary + dedup around the real handler.
@@ -6290,29 +6805,92 @@ class MaxwellBot(commands.Bot):
         never answered. It also had no dedup, so a gateway resume that
         redelivered MESSAGE_CREATE produced a second full reply.
         """
-        self._dispatch_plugin_event("on_message", message)
-        message_id = getattr(message, "id", None)
+        message_id = str(getattr(message, "id", "") or "")
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        journal = getattr(self, "_request_journal", None)
+        processing = getattr(self, "_inbound_processing", None)
+        if processing is None:
+            processing = self._inbound_processing = set()
+        started = time.monotonic()
+        acquired = False
         try:
-            if not self._inbound_dedup.check_and_add(message_id):
-                logger.debug("Duplicate MESSAGE_CREATE %s ignored", message_id)
+            if journal is not None:
+                try:
+                    journal.accept(
+                        message_id,
+                        channel_id,
+                        getattr(getattr(message, "author", None), "id", ""),
+                        directed=self._directly_addressed(message),
+                    )
+                except Exception:
+                    self._freeze_failed_receipt(channel_id, message_id)
+                    raise
+                row = journal.get(message_id)
+                if row and row["status"] in _REQUEST_TERMINAL:
+                    return
+                if self._reply_queue.contains(channel_id, message_id):
+                    return
+            elif not self._inbound_dedup.check_and_add(message_id):
                 return
-            # Record how far this room has been read BEFORE doing any work, so
-            # a crash mid-handler does not make the reconnect replay it.
-            with contextlib.suppress(Exception):
+            if message_id in processing:
+                return
+            processing.add(message_id)
+            acquired = True
+            # Journal first. Keep an outage cursor frozen while newer live
+            # receipts arrive; they are independently durable in the journal.
+            if channel_id not in (getattr(self, "_recovery_cursors", None) or {}):
                 self._watermarks.note(
-                    getattr(getattr(message, "channel", None), "id", ""),
+                    channel_id,
                     message_id,
                 )
-            await self._on_message_impl(message)
+            if journal is not None:
+                journal.update(message_id, "received")
+            self._dispatch_plugin_event("on_message", message)
+            async with asyncio.timeout(
+                MaxwellBot._inbound_setting(
+                    self, "live_turn_timeout_seconds", 180, 1, 7200
+                )
+            ):
+                reason = await self._on_message_impl(message)
+            row = MaxwellBot._request_state(self, message)
+            if row.get("status") == "received":
+                MaxwellBot._record_request_outcome(
+                    self, message, "suppressed", reason or "not_addressed"
+                )
         except asyncio.CancelledError:
+            MaxwellBot._record_request_outcome(
+                self, message, "deferred", "admission_cancelled"
+            )
             raise
-        except Exception:
-            # A single malformed message must not be able to take the handler
-            # down silently. The id is logged so the message can be found.
-            logger.exception(
-                "on_message failed for %s in %s",
+        except Exception as exc:
+            logger.warning(
+                "inbound mid=%s cid=%s stage=admission_error error=%s",
                 message_id,
-                getattr(getattr(message, "channel", None), "id", "?"),
+                channel_id,
+                type(exc).__name__,
+            )
+            row = journal.get(message_id) if journal is not None else None
+            if row:
+                if (
+                    row["status"] not in _REQUEST_TERMINAL
+                    and not row["effects_started"]
+                ):
+                    journal.begin(message_id)
+                await self._request_failure(
+                    message,
+                    f"admission:{type(exc).__name__}",
+                    retryable=isinstance(
+                        exc, (TimeoutError, ConnectionError, aiohttp.ClientError)
+                    ),
+                )
+        finally:
+            if acquired:
+                processing.discard(message_id)
+            logger.info(
+                "inbound mid=%s cid=%s stage=admission_finished duration_ms=%d",
+                message_id,
+                channel_id,
+                (time.monotonic() - started) * 1000,
             )
 
     async def _on_message_impl(self, message):
@@ -6338,13 +6916,13 @@ class MaxwellBot(commands.Bot):
         self.clear_message_taint(message)
         author = getattr(message, "author", None)
         if author is None:
-            return
+            return "missing_author"
         if not author.bot:
-            preview = message.content[:100] if message.content else "[no text]"
-            if not self._control.get("log_messages", True):
-                preview = "[hidden]"
             logger.info(
-                f"MSG from {message.author.display_name} ({message.author.id}) in {getattr(message.channel, 'name', 'DM')}: {preview}"
+                "inbound mid=%s cid=%s stage=received author_id=%s",
+                getattr(message, "id", ""),
+                message.channel.id,
+                author.id,
             )
 
         # BUG FIX: blacklist/ignore must be checked BEFORE command handling.
@@ -6356,7 +6934,7 @@ class MaxwellBot(commands.Bot):
             or str(message.author.id)
             in set(self._control.get("ignore_users", []) or [])
         ) and not self._is_admin(message.author.id):
-            return
+            return "ignored_author"
 
         if (
             message.content
@@ -6365,24 +6943,24 @@ class MaxwellBot(commands.Bot):
         ):
             # Unknown prefix text (".ok", "...") is chat, not a command.
             if await self._handle_command(message) is not False:
-                return
+                return "command"
 
         if not self._control.get("bot_enabled", True):
-            return
+            return "bot_disabled"
 
         channel_id = str(message.channel.id)
         now = asyncio.get_running_loop().time()
         if now < self._stop_until.get(channel_id, 0):
-            return
+            return "stop_active"
         if channel_id in set(self._control.get("blocked_channels", []) or []):
-            return
+            return "blocked_channel"
         allowed = set(self._control.get("allowed_channels", []) or [])
         if allowed and channel_id not in allowed:
-            return
+            return "channel_not_allowed"
         # ,solo: this server is locked to one channel. Commands already
         # returned above, so an admin can still run `,solo off` from anywhere.
         if self._solo_blocks(message):
-            return
+            return "solo_restriction"
 
         payloads = iter_message_payloads(message)
         has_content = any(
@@ -6451,10 +7029,10 @@ class MaxwellBot(commands.Bot):
             # doesn't need a second one. The bot-self branch above
             # already records the message so the next human message
             # sees it as context.
-            return
+            return "self_message"
 
         if not message_has_visible_payload(message):
-            return
+            return "empty_payload"
 
         # Resolve the referenced message before acquiring the channel lock so
         # the same-user interrupt below can tell whether this is a reply to
@@ -6466,62 +7044,27 @@ class MaxwellBot(commands.Bot):
             and not message_reference_is_forward(message)
         ):
             try:
-                message.reference.resolved = await message.channel.fetch_message(
-                    message.reference.message_id
+                message.reference.resolved = await asyncio.wait_for(
+                    message.channel.fetch_message(message.reference.message_id),
+                    timeout=10,
                 )
             except Exception as e:
-                logger.warning(f"Failed to fetch referenced message: {e}")
+                # Unknown parent may be a reply to us. Retry boundedly rather
+                # than classifying a hard ping as ambient chatter.
+                if not self._directly_addressed(message):
+                    journal = getattr(self, "_request_journal", None)
+                    if journal is not None:
+                        journal.begin(message.id)
+                        await self._request_failure(
+                            message,
+                            f"unresolved_reply:{type(e).__name__}",
+                            retryable=not isinstance(
+                                e, (discord.Forbidden, discord.NotFound)
+                            ),
+                        )
+                    return "unresolved_reply"
         with contextlib.suppress(Exception):
             await self._ensure_reply_chain_resolved(message)
-
-        # Same-user re-ping while a request is in-flight in this channel.
-        # In DMs or direct follow-ups with media / new queries, interrupt the
-        # in-flight task so Maxwell sees the newest context (plus previous images)
-        # immediately instead of making the user wait or dropping the new input.
-        if not message.author.bot and self.user is not None:
-            active = self._active_requests.get(channel_id)
-            active_user = self._active_request_user.get(channel_id)
-            if (
-                active is not None
-                and active is not asyncio.current_task()
-                and not active.done()
-                and active_user == str(message.author.id)
-                and self._should_interrupt_inflight(message)
-            ):
-                is_dm = isinstance(getattr(message, "channel", None), discord.DMChannel)
-                has_media = bool(
-                    getattr(message, "attachments", None)
-                    or getattr(message, "embeds", None)
-                    or getattr(message, "stickers", None)
-                )
-                # Always interrupt if the same user directly pings/messages again
-                # (in DMs, media bursts, or guild channels) so the newer query takes over
-                # and doesn't get dropped or starved behind a slow LLM turn.
-                logger.info(
-                    f"Same-user INTERRUPT in {channel_id} (DM={is_dm}, media={has_media}): "
-                    f"cancelling in-flight task {active} to merge latest context."
-                )
-                active.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(_await_task_done(active)), timeout=2.5
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"Interrupt cancel timed out for {channel_id} - proceeding anyway"
-                    )
-                except Exception as e:
-                    logger.debug(f"Interrupt await raised {e} for {channel_id}")
-                # Brief yield to let the cancelled task's finally release the channel lock
-                await asyncio.sleep(0.08)
-                # Same lesson as ",stop": cancelling the in-flight task lets
-                # the pump immediately start a queued soft watch line, which
-                # starves this interrupting ping. Drop only soft chatter;
-                # directed pings already in queue still get their turn.
-                with contextlib.suppress(Exception):
-                    self._reply_queue.drop_soft(channel_id)
 
         # Serialize only the memory/bookkeeping write for this room. Reply
         # generation happens AFTER the lock is released, through the reply
@@ -6637,7 +7180,7 @@ class MaxwellBot(commands.Bot):
                 logger.info(
                     f"Cooldown skip reply for user {message.author.id} in {channel_id} (still stored to memory)"
                 )
-                return
+                return "cooldown"
 
         if isinstance(message.channel, discord.DMChannel):
             if self._control.get("reply_dms", True):
@@ -6646,12 +7189,12 @@ class MaxwellBot(commands.Bot):
                     self._content_without_self_mention(message.content),
                     directed=True,
                 )
-            return
+            return "dm_replies_disabled"
 
         if isinstance(message.channel, discord.GroupChannel):
             if not self._control.get("reply_groups", True):
                 self._touch_watch_debounce(message)
-                return
+                return "group_replies_disabled"
             await self._maybe_live_reply(
                 message, self._content_without_self_mention(message.content)
             )
@@ -6660,7 +7203,7 @@ class MaxwellBot(commands.Bot):
         if message.guild:
             if not self._control.get("reply_mentions", True):
                 self._touch_watch_debounce(message)
-                return
+                return "mention_replies_disabled"
             clean = self._content_without_self_mention(message.content)
             # Bare @Maxwell with no extra text: still a turn. Do not
             # invent "look at this" — he should read the room (and any
@@ -6968,6 +7511,7 @@ class MaxwellBot(commands.Bot):
             return False
         if cmd in set(self._control.get("disabled_commands", []) or []):
             return
+        MaxwellBot._mark_request_effect(self, message)
         admin_commands = {
             "prompt",
             "clearprompt",
@@ -7009,6 +7553,25 @@ class MaxwellBot(commands.Bot):
                 active = self._active_requests.get(channel_id)
                 self._stop_until[channel_id] = asyncio.get_running_loop().time() + 1
                 queued = self._reply_queue.depth(channel_id)
+                journal = getattr(self, "_request_journal", None)
+                if journal is not None:
+                    active_message = (
+                        getattr(self, "_active_request_messages", None) or {}
+                    ).get(channel_id)
+                    if active_message is not None:
+                        MaxwellBot._record_request_outcome(
+                            self, active_message, "superseded", "explicit_stop"
+                        )
+                    # Drain all pages: the command must also stop overflow
+                    # pings which have never entered the in-memory queue.
+                    for row in journal.pending(limit=1000000):
+                        if row["channel_id"] == channel_id and row["message_id"] != str(
+                            message.id
+                        ):
+                            journal.update(
+                                row["message_id"], "superseded", reason="explicit_stop"
+                            )
+                            queued += 1
                 stopped = self._reply_queue.cancel_channel(channel_id, clear_queue=True)
                 if active and not active.done():
                     active.cancel()
@@ -11374,6 +11937,12 @@ class MaxwellBot(commands.Bot):
         retried as a plain ``channel.send`` so the reply still lands.
         """
         await self._respect_slowmode(channel)
+        request = _current_inbound.get()
+        if request is not None:
+            MaxwellBot._mark_request_effect(self, request)
+            state = _current_inbound_effects.get()
+            if state is not None:
+                state["send_attempted"] = True
         # Never forward a second `content`/`file` into discord.py — send()
         # takes those as keywords, and a leaked kwarg becomes
         # "got multiple values for keyword argument 'content'".
@@ -11427,6 +11996,8 @@ class MaxwellBot(commands.Bot):
                     )
                     return None
             self._mark_bot_sent(channel)
+            if request is not None:
+                MaxwellBot._record_delivery(self, request, sent)
             return sent
         try:
             if stickers:
@@ -11443,6 +12014,8 @@ class MaxwellBot(commands.Bot):
             )
             return None
         self._mark_bot_sent(channel)
+        if request is not None:
+            MaxwellBot._record_delivery(self, request, sent)
         return sent
 
     def _message_carries_media(self, message) -> bool:
@@ -13204,6 +13777,7 @@ class MaxwellBot(commands.Bot):
         sleeping, secs = self._is_sleeping()
         if not sleeping:
             return True
+        MaxwellBot._record_request_outcome(self, message, "suppressed", "sleep_policy")
         uid = str(getattr(message.author, "id", "") or "")
         if not self._directly_addressed(message):
             logger.info(
@@ -13229,7 +13803,7 @@ class MaxwellBot(commands.Bot):
         remaining = self._format_sleep_remaining(secs)
         body = (
             f"max is sleeping rn, back in ~{remaining}. "
-            "drop a message and i'll see it when i wake up."
+            "please ping me again when i'm awake."
         )
         with contextlib.suppress(Exception):
             await message.channel.send(
@@ -13258,6 +13832,7 @@ class MaxwellBot(commands.Bot):
             return
         turn_context = self._begin_inflight_context(message, content)
         live_typing = await self._enter_live_typing(message)
+        turn_context["live_typing"] = live_typing
         author = getattr(message, "author", None)
         if (
             author is not None
@@ -13496,7 +14071,9 @@ class MaxwellBot(commands.Bot):
 
                 async def _exec_yt(u):
                     try:
-                        res = await self.tools["youtube"].execute(message, url=u)
+                        res = await self._invoke_request_tool(
+                            message, "youtube", self.tools["youtube"], url=u
+                        )
                         return (u, res)
                     except Exception as e:
                         logger.warning(f"Auto youtube tool failed for {u}: {e}")
@@ -13530,8 +14107,9 @@ class MaxwellBot(commands.Bot):
                 try:
                     q = MaxwellBot._extract_search_query(content)
                     if q:
-                        search_res = await self.tools["web_search"].execute(
-                            message, query=q, max_results="5"
+                        search_res = await self._invoke_request_tool(
+                            message, "web_search", self.tools["web_search"],
+                            query=q, max_results="5"
                         )
                         if search_res and not str(search_res).lower().startswith(
                             "error"
@@ -13602,6 +14180,25 @@ class MaxwellBot(commands.Bot):
             self._end_inflight_context(turn_context)
             await self._exit_live_typing(live_typing)
             return
+        if self._control.get(
+            "require_direct_response", True
+        ) and self._directly_addressed(message):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "This is a direct request. Provide a visible answer via send_message "
+                        "or a completed media reply. Do not use no_response for this request. "
+                        "If you cannot complete it, briefly say so; do not promise later work "
+                        "unless you have actually scheduled it."
+                    ),
+                }
+            )
+        logger.info(
+            "inbound mid=%s cid=%s stage=prepared",
+            getattr(message, "id", ""),
+            channel_id,
+        )
         if pre_tool_results:
             # General pre-tool results (YouTube + auto current-info searches etc.)
             yt_only = [r for r in pre_tool_results if "youtube" in r.lower()]
@@ -13842,6 +14439,8 @@ class MaxwellBot(commands.Bot):
                 gen_progress = None
             if (not response or not str(response).strip()) and not native_calls:
                 logger.warning(f"Empty response from provider for channel {channel_id}")
+                if MaxwellBot._request_state(self, message):
+                    return
                 if self._control.get("error_replies", True):
                     try:
                         await message.channel.send(
@@ -14081,9 +14680,14 @@ class MaxwellBot(commands.Bot):
                     await self._release_ai_slot()
             # Terminal silence only for explicit no_response (not TTS).
             if any(
-                tr.startswith("Tool no_response:") and "__NO_RESPONSE__" in tr
+                tr.startswith("Tool no_response:")
+                and "__NO_RESPONSE__" in tr
+                and not tr.startswith("Tool no_response: Error")
                 for tr in all_tool_results
             ):
+                MaxwellBot._record_request_outcome(
+                    self, message, "suppressed", "no_response"
+                )
                 # Feedback for the watch: repeated silence in a room shortens
                 # how long that room stays on watch at all.
                 with contextlib.suppress(Exception):
@@ -14177,6 +14781,7 @@ class MaxwellBot(commands.Bot):
                 and self._looks_like_html_document(response)
             ):
                 try:
+                    MaxwellBot._mark_request_effect(self, message)
                     site_result = await self._auto_route_html_to_site(
                         message, response, content or ""
                     )
@@ -14184,11 +14789,10 @@ class MaxwellBot(commands.Bot):
                         await self._ensure_reasoning_trace(
                             message, all_tool_results, site_result, "auto_site"
                         )
-                        try:
-                            await message.reply(site_result)
-                        except (discord.NotFound, discord.Forbidden):
-                            await message.channel.send(site_result)
-                        normal_reply_sent = True
+                        sent = await self._send_with_slowmode(
+                            message.channel, site_result, reply_to=message
+                        )
+                        normal_reply_sent = sent is not None
                         # Record the auto-routed site link in memory so
                         # the user can come back and ask "where did you
                         # put my site?" without maxwell drawing a blank.
@@ -14246,7 +14850,11 @@ class MaxwellBot(commands.Bot):
                 # transition_to_final returns False and we fall through to
                 # the normal reply path.
                 transitioned = False
-                if chunks and chunks[0]:
+                if (
+                    chunks
+                    and chunks[0]
+                    and not MaxwellBot._request_state(self, message)
+                ):
                     for _prog in reversed(active_progresses):
                         if _prog is None:
                             continue
@@ -14345,6 +14953,8 @@ class MaxwellBot(commands.Bot):
             logger.info(f"Cancelled active request in channel {channel_id}")
             raise
         except ProviderUsageExhaustedError as e:
+            if MaxwellBot._request_state(self, message):
+                raise
             logger.warning(f"Provider usage exhausted while handling message: {e}")
             if self._control.get("error_replies", True):
                 try:
@@ -14353,6 +14963,8 @@ class MaxwellBot(commands.Bot):
                 except discord.Forbidden as _exc:
                     pass
         except ProviderEmptyResponseError as e:
+            if MaxwellBot._request_state(self, message):
+                return
             logger.warning("Provider returned no usable response: %s", e)
             if self._control.get("error_replies", True):
                 try:
@@ -14361,6 +14973,8 @@ class MaxwellBot(commands.Bot):
                 except discord.Forbidden as _exc:
                     pass
         except Exception as e:
+            if MaxwellBot._request_state(self, message):
+                raise
             is_timeout = isinstance(e, asyncio.TimeoutError) or (
                 isinstance(e, RuntimeError) and "timed out" in str(e).lower()
             )
@@ -14369,7 +14983,7 @@ class MaxwellBot(commands.Bot):
                 try:
                     if is_timeout:
                         await message.channel.send(
-                            "timed out waiting for a response (10 min). try again or break the task into smaller pieces."
+                            "timed out waiting for a response. try again or break the task into smaller pieces."
                         )
                     elif self._control.get("error_details", True):
                         await message.channel.send(
@@ -14601,11 +15215,17 @@ class MaxwellBot(commands.Bot):
                         else contextlib.nullcontext()
                     )
                     async with gate:
-                        raw = await tool.execute(message, **params)
+                        raw = await MaxwellBot._invoke_request_tool(
+                            self, message, name, tool, **params
+                        )
                     if raw is None:
                         result_text = ""
                     else:
                         result_text = str(raw)
+                    if result_text.startswith(("__TTS_SENT__", "__MEDIA_SENT__")):
+                        MaxwellBot._record_request_outcome(
+                            self, message, "delivered", f"confirmed_{name}"
+                        )
                     if not result_text.strip() and name in RESULT_TOOL_NAMES:
                         result_text = "(no output)"
                     logger.info(
@@ -15012,8 +15632,11 @@ class MaxwellBot(commands.Bot):
                                 f"Failed to record skipped no_response after send: {e}"
                             )
                         continue
-                    no_response_seen = True
-                    tool_results.append(await run_one(call))
+                    line = await run_one(call)
+                    tool_results.append(line)
+                    no_response_seen = line.startswith(
+                        "Tool no_response: __NO_RESPONSE__"
+                    )
                     continue
                 if no_response_seen:
                     # The model emitted no_response first then tried to
@@ -15046,7 +15669,10 @@ class MaxwellBot(commands.Bot):
                 line = await run_one(call)
                 tool_results.append(line)
                 if call["name"] == "send_message":
-                    send_message_seen = True
+                    send_message_seen = (
+                        "__MESSAGE_SENT__" in line
+                        and not line.startswith("Tool send_message: Error")
+                    )
 
         # Tools must run EXACTLY ONCE. The old `except Exception: await run_all()`
         # re-ran every non-idempotent tool when run_all() raised partway (e.g. a
@@ -15324,6 +15950,7 @@ class MaxwellBot(commands.Bot):
             traces.append(
                 {
                     "ts": now,
+                    "message_id": str(getattr(message, "id", "") or ""),
                     "channel_id": str(
                         getattr(getattr(message, "channel", None), "id", "")
                     ),
